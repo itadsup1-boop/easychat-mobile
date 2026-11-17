@@ -123,6 +123,23 @@ const followupService = new FollowupService(db);
 const authService = new AuthService(db);
 const centralAuthClient = new CentralAuthClient();
 app.use(express.json());
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-EasyChat-Session');
+  }
+  const mobileToken = req.headers['x-easychat-session'];
+  if (mobileToken && (!req.headers.cookie || !req.headers.cookie.includes('crm_session='))) {
+    req.headers.cookie = (req.headers.cookie ? `${req.headers.cookie}; ` : '') + `crm_session=${mobileToken}`;
+  }
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(204);
+  }
+  next();
+});
 
 function sendAuthError(res, error) {
   const status = error instanceof AuthError || error instanceof CentralAuthError ? error.status : (error?.status || 500);
@@ -168,7 +185,7 @@ app.post('/api/auth/register', async (req, res) => {
     const user = await authService.registerManaged(req.body || {}, centralAuthClient);
     const session = authService.login(req.body || {});
     res.setHeader('Set-Cookie', authService.sessionCookie(session.token));
-    res.status(201).json({ success: true, user });
+    res.status(201).json({ success: true, user, token: session.token });
   } catch (error) {
     sendAuthError(res, error);
   }
@@ -180,7 +197,7 @@ app.post('/api/auth/login', async (req, res) => {
       ? authService.login(req.body || {})
       : await authService.loginManaged(req.body || {}, centralAuthClient);
     res.setHeader('Set-Cookie', authService.sessionCookie(session.token));
-    res.json({ success: true, user: session.user });
+    res.json({ success: true, user: session.user, token: session.token });
   } catch (error) {
     sendAuthError(res, error);
   }
@@ -194,7 +211,7 @@ app.post('/api/auth/google', async (req, res) => {
     res.setHeader('Set-Cookie', authService.sessionCookie(session.token));
     latestLocalSession = { token: session.token, user: session.user, expiresAt: Date.now() + 60000 };
     io.emit('AUTH_SUCCESS', { user: session.user, token: session.token });
-    res.json({ success: true, user: session.user });
+    res.json({ success: true, user: session.user, token: session.token });
   } catch (error) {
     sendAuthError(res, error);
   }

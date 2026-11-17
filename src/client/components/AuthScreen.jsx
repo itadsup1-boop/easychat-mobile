@@ -19,6 +19,31 @@ export default function AuthScreen({ onAuthenticated }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [successMsg, setSuccessMsg] = useState('');
+  const [serverUrl, setServerUrl] = useState(() => {
+    try {
+      return window.localStorage?.getItem('easychat_server_url') || '';
+    } catch (_) {
+      return '';
+    }
+  });
+  const [showServerConfig, setShowServerConfig] = useState(() => {
+    try {
+      const saved = window.localStorage?.getItem('easychat_server_url') || '';
+      const isCapacitorHost = typeof window !== 'undefined' && (window.location.protocol === 'capacitor:' || (window.location.hostname === 'localhost' && !window.location.port));
+      return Boolean(saved || isCapacitorHost);
+    } catch (_) {
+      return false;
+    }
+  });
+
+  const handleSaveServerUrl = (val) => {
+    const cleaned = String(val || '').trim().replace(/\/+$/, '');
+    setServerUrl(val);
+    try {
+      if (cleaned) window.localStorage?.setItem('easychat_server_url', cleaned);
+      else window.localStorage?.removeItem('easychat_server_url');
+    } catch (_) {}
+  };
 
   useEffect(() => {
     if (otpCooldown <= 0) return undefined;
@@ -269,6 +294,37 @@ export default function AuthScreen({ onAuthenticated }) {
               <form onSubmit={submit} className="space-y-4">
                 {successMsg && <div role="status" className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2.5 text-sm text-emerald-800 font-medium">{successMsg}</div>}
                 {error && <div role="alert" className="rounded-lg border border-red-200 bg-red-50 px-3 py-2.5 text-sm text-red-700">{error}</div>}
+
+                <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-bold text-slate-700">🌐 Máy chủ kết nối (App Mobile / APK)</span>
+                    <button
+                      type="button"
+                      onClick={() => setShowServerConfig((v) => !v)}
+                      className="text-xs font-semibold text-blue-600 hover:underline"
+                    >
+                      {showServerConfig ? 'Thu gọn' : (serverUrl ? 'Đổi máy chủ' : 'Cấu hình IP')}
+                    </button>
+                  </div>
+                  {showServerConfig ? (
+                    <div className="mt-2 space-y-1.5">
+                      <input
+                        type="url"
+                        value={serverUrl}
+                        onChange={(e) => handleSaveServerUrl(e.target.value)}
+                        placeholder="VD: http://192.168.1.10:5050 hoặc https://crm.tenmien.com"
+                        className="w-full h-10 rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-900 placeholder:text-slate-400 outline-none focus:border-blue-600"
+                      />
+                      <p className="text-[11px] text-slate-500 leading-snug">
+                        Nếu cài file APK trên điện thoại, nhập địa chỉ IP máy tính đang chạy Server (cùng Wi-Fi) hoặc tên miền VPS của bạn. Để trống nếu mở trực tiếp trên trình duyệt.
+                      </p>
+                    </div>
+                  ) : (
+                    <p className="mt-1 text-[11px] text-slate-500 truncate">
+                      Đang dùng: <span className="font-mono text-slate-700">{serverUrl || window.location.origin}</span>
+                    </p>
+                  )}
+                </div>
 
                 <label className="block space-y-1.5">
                   <span className="text-sm font-medium text-slate-700">{mode === 'login' ? 'Tên đăng nhập hoặc Gmail' : 'Gmail đăng ký'}</span>
