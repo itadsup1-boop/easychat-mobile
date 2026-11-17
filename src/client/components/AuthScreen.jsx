@@ -26,15 +26,7 @@ export default function AuthScreen({ onAuthenticated }) {
       return '';
     }
   });
-  const [showServerConfig, setShowServerConfig] = useState(() => {
-    try {
-      const saved = window.localStorage?.getItem('easychat_server_url') || '';
-      const isCapacitorHost = typeof window !== 'undefined' && (window.location.protocol === 'capacitor:' || (window.location.hostname === 'localhost' && !window.location.port));
-      return Boolean(saved || isCapacitorHost);
-    } catch (_) {
-      return false;
-    }
-  });
+  const [showServerConfig, setShowServerConfig] = useState(false);
 
   const handleSaveServerUrl = (val) => {
     const cleaned = String(val || '').trim().replace(/\/+$/, '');
@@ -295,34 +287,41 @@ export default function AuthScreen({ onAuthenticated }) {
                 {successMsg && <div role="status" className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2.5 text-sm text-emerald-800 font-medium">{successMsg}</div>}
                 {error && <div role="alert" className="rounded-lg border border-red-200 bg-red-50 px-3 py-2.5 text-sm text-red-700">{error}</div>}
 
-                <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+                <div className="rounded-xl border border-emerald-200 bg-emerald-50/70 p-3">
                   <div className="flex items-center justify-between">
-                    <span className="text-xs font-bold text-slate-700">🌐 Máy chủ kết nối (App Mobile / APK)</span>
+                    <span className="text-xs font-bold text-emerald-800">🟢 Máy chủ Cloud EasyChat (Độc lập như PC)</span>
                     <button
                       type="button"
                       onClick={() => setShowServerConfig((v) => !v)}
                       className="text-xs font-semibold text-blue-600 hover:underline"
                     >
-                      {showServerConfig ? 'Thu gọn' : (serverUrl ? 'Đổi máy chủ' : 'Cấu hình IP')}
+                      {showServerConfig ? 'Thu gọn' : (serverUrl ? 'Đang dùng IP riêng' : 'Nâng cao')}
                     </button>
                   </div>
-                  {showServerConfig ? (
+                  {showServerConfig && (
                     <div className="mt-2 space-y-1.5">
-                      <input
-                        type="url"
-                        value={serverUrl}
-                        onChange={(e) => handleSaveServerUrl(e.target.value)}
-                        placeholder="VD: http://192.168.1.10:5050 hoặc https://crm.tenmien.com"
-                        className="w-full h-10 rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-900 placeholder:text-slate-400 outline-none focus:border-blue-600"
-                      />
-                      <p className="text-[11px] text-slate-500 leading-snug">
-                        Nếu cài file APK trên điện thoại, nhập địa chỉ IP máy tính đang chạy Server (cùng Wi-Fi) hoặc tên miền VPS của bạn. Để trống nếu mở trực tiếp trên trình duyệt.
+                      <div className="flex gap-1.5">
+                        <input
+                          type="url"
+                          value={serverUrl}
+                          onChange={(e) => handleSaveServerUrl(e.target.value)}
+                          placeholder="Để trống để chạy độc lập (mặc định)"
+                          className="flex-1 h-9 rounded-lg border border-slate-300 bg-white px-3 text-xs text-slate-900 placeholder:text-slate-400 outline-none focus:border-blue-600"
+                        />
+                        {serverUrl && (
+                          <button
+                            type="button"
+                            onClick={() => handleSaveServerUrl('')}
+                            className="px-2.5 h-9 rounded-lg bg-slate-200 hover:bg-slate-300 text-xs font-semibold text-slate-700"
+                          >
+                            Mặc định
+                          </button>
+                        )}
+                      </div>
+                      <p className="text-[11px] text-slate-600 leading-snug">
+                        Mặc định (để trống): App tự động đăng nhập qua Cloud License Server giống bản PC và chạy Fanpage trực tiếp trên điện thoại.
                       </p>
                     </div>
-                  ) : (
-                    <p className="mt-1 text-[11px] text-slate-500 truncate">
-                      Đang dùng: <span className="font-mono text-slate-700">{serverUrl || window.location.origin}</span>
-                    </p>
                   )}
                 </div>
 

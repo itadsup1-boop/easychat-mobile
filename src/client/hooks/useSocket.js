@@ -1,13 +1,25 @@
 import { useEffect, useState } from 'react';
 import { io } from 'socket.io-client';
+import { createVirtualMobileSocket } from '../mobileStandaloneEngine.js';
 
-function resolveSocketUrl() {
-  if (typeof window === 'undefined') return 'http://localhost:5050';
+function getSavedServerUrl() {
+  if (typeof window === 'undefined') return '';
   try {
     const saved = String(window.localStorage?.getItem('easychat_server_url') || '').trim().replace(/\/+$/, '');
     if (saved && /^https?:\/\//i.test(saved)) return saved;
   } catch (_) {}
-  return window.location.origin;
+  return '';
+}
+
+function shouldUseVirtualMobileSocket() {
+  if (typeof window === 'undefined') return false;
+  if (getSavedServerUrl()) return false;
+  const proto = String(window.location.protocol || '');
+  const host = String(window.location.hostname || '');
+  const port = String(window.location.port || '');
+  if (proto === 'capacitor:' || proto === 'file:') return true;
+  if ((host === 'localhost' || host === '127.0.0.1') && !port) return true;
+  return false;
 }
 
 export function useSocket(enabled = true) {
@@ -20,24 +32,41 @@ export function useSocket(enabled = true) {
       setIsConnected(false);
       return undefined;
     }
-    const targetUrl = resolveSocketUrl();
+
+    if (shouldUseVirtualMobileSocket()) {
+      const vSocket = createVirtualMobileSocket();
+      setSocket(vSocket);
+      setIsConnected(true);
+      return () => {
+        vSocket.close();
+      };
+    }
+
+    const targetUrl = getSavedServerUrl() || window.location.origin;
     const newSocket = io(targetUrl, {
       transports: ['websocket', 'polling'],
       withCredentials: true,
-      reconnectionAttempts: Infinity,
+      reconnectionAttempts: 3,
       reconnectionDelay: 1000,
-      reconnectionDelayMax: 10000,
-      randomizationFactor: 0.25
+      reconnectionDelayMax: 5000
     });
 
     newSocket.on('connect', () => {
-      console.log('[Socket.io Client] Đã kết nối thành công:', newSocket.id);
       setIsConnected(true);
     });
 
     newSocket.on('disconnect', () => {
-      console.warn('[Socket.io Client] Ngắt kết nối socket');
       setIsConnected(false);
+    });
+
+    newSocket.on('connect_error', () => {
+      // Fallback to virtual mobile socket if no PC backend is reachable
+      if (!getSavedServerUrl()) {
+        newSocket.close();
+        const vSocket = createVirtualMobileSocket();
+        setSocket(vSocket);
+        setIsConnected(true);
+      }
     });
 
     setSocket(newSocket);
