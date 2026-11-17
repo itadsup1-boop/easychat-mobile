@@ -1,0 +1,135 @@
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('fs');
+const vm = require('vm');
+
+const context = { console };
+vm.createContext(context);
+vm.runInContext(fs.readFileSync('src/extension/textFilter.js', 'utf8'), context);
+const clean = context.FbCrmTextFilter.cleanMessageText;
+
+test('strips an unread divider concatenated with the first real message', () => {
+  assert.equal(clean('Tin nh\u1eafn ch\u01b0a \u0111\u1ecdc:Oo'), 'Oo');
+  assert.equal(clean('Unread messages: hello'), 'hello');
+});
+
+test('rejects relative-time metadata mounted beside Messenger bubbles', () => {
+  assert.equal(clean('2 ph\u00fat'), '');
+  assert.equal(clean('27 ph\u00fat tr\u01b0\u1edbc'), '');
+  assert.equal(clean('4 minutes'), '');
+  assert.equal(clean('1 hour ago'), '');
+});
+
+test('strips a Messenger delivery badge glued directly to message text', () => {
+  assert.equal(clean('vfffffĐã gửi'), 'vfffff');
+  assert.equal(clean('helloSent'), 'hello');
+  assert.equal(clean('Tôi đã gửi hàng rồi'), 'Tôi đã gửi hàng rồi');
+});
+
+test('strips Vietnamese accessibility label without losing message content', () => {
+  assert.equal(clean('Tin nhắn do Bảo Khánh gửi lúc Thứ Sáu 10:09 sáng: 👍'), '👍');
+});
+
+test('strips English accessibility label without losing message content', () => {
+  assert.equal(clean('Message sent by Alice at Friday 10:09: hello'), 'hello');
+});
+
+test('identifies and rejects system labels as contact names', () => {
+  const isInvalid = context.FbCrmTextFilter.isInvalidContactName;
+  const cleanContact = context.FbCrmTextFilter.cleanContactName;
+
+  assert.equal(isInvalid('Tất cả tin nhắn'), true);
+  assert.equal(isInvalid('Tất cả'), true);
+  assert.equal(isInvalid('All messages'), true);
+  assert.equal(isInvalid('Hộp thư đến'), true);
+  assert.equal(isInvalid('Chưa đọc'), true);
+  assert.equal(isInvalid('Đang hoạt động'), true);
+  assert.equal(isInvalid('Hoạt động 5 phút trước'), true);
+  assert.equal(isInvalid('Facebook'), true);
+  assert.equal(isInvalid('Messenger'), true);
+  assert.equal(isInvalid('Meta'), true);
+
+  assert.equal(isInvalid('Thu Oanh Nguyen'), false);
+  assert.equal(isInvalid('Nguyễn Trường'), false);
+  assert.equal(isInvalid('John Doe'), false);
+
+  assert.equal(cleanContact('Tất cả tin nhắn'), 'Khách hàng');
+  assert.equal(cleanContact('Thu Oanh Nguyen'), 'Thu Oanh Nguyen');
+});
+
+test('rejects the E2EE "restore chat history" interstitial as message content, not just Vietnamese wording (2026-08-20 live capture)', () => {
+  assert.equal(clean('Restore messages'), '');
+  assert.equal(clean('Restore now'), '');
+  assert.equal(clean('Personal chats are secured with end-to-end encryption, so you need to restore chat history when you switch devices.'), '');
+  assert.equal(clean('Khôi phục tin nhắn'), '');
+  assert.equal(clean('Thiếu tin nhắn.'), '');
+  assert.equal(clean('Thiếu tin nhắn'), '');
+  assert.equal(clean('Không khôi phục được tin nhắn.'), '');
+  assert.equal(clean('Không khôi phục được tin nhắn'), '');
+});
+
+test('rejects short day-of-week/relative-day separators leaking in as fake messages (spec 047)', () => {
+  assert.equal(clean('Thứ Ba'), '');
+  assert.equal(clean('Thứ Hai'), '');
+  assert.equal(clean('Chủ Nhật'), '');
+  assert.equal(clean('Hôm nay'), '');
+  assert.equal(clean('Hôm qua'), '');
+});
+
+test('rejects the Business Suite "add a personalized message" CTA leaking in as a fake Page message (2026-08-20 live report)', () => {
+  assert.equal(clean('Thêm tin nhắn được cá nhân hóa.'), '');
+  assert.equal(clean('Thêm tin nhắn được cá nhân hóa'), '');
+  assert.equal(clean('Thêm tin nhắn được cá nhân hoá.'), '');
+});
+
+test('rejects standalone and trailing time/date noise fragments', () => {
+  assert.equal(clean('20ch'), '');
+  assert.equal(clean('19ch'), '');
+  assert.equal(clean('8sa'), '');
+  assert.equal(clean('20:00ch'), '');
+  assert.equal(clean('53 9 Tháng 9'), '');
+  assert.equal(clean('53 9 Tháng 9, 2026'), '');
+  assert.equal(clean('Thứ Năm, 9 Tháng 9'), '');
+  assert.equal(clean('9 Tháng 9'), '');
+  assert.equal(clean('9 thg 9'), '');
+  assert.equal(clean('Hello world  20ch'), 'Hello world');
+  assert.equal(clean('Hello world\n20ch'), 'Hello world');
+});
+
+test('rejects standalone middle dots, bullets, and separator noise leaking in from Messenger sidebar', () => {
+  assert.equal(clean('·'), '');
+  assert.equal(clean('•'), '');
+  assert.equal(clean('.'), '');
+  assert.equal(clean(' · '), '');
+  assert.equal(clean(' - '), '');
+  assert.equal(clean(' | '), '');
+  assert.equal(clean('\u00b7'), '');
+  assert.equal(clean('\u2022'), '');
+  assert.equal(clean('...'), '');
+  // Legitimate short messages must not be touched
+  assert.equal(clean('Ok'), 'Ok');
+  assert.equal(clean('Hi'), 'Hi');
+  assert.equal(clean('A.'), 'A.');
+});
+
+
+
+// ── 2026-09-28: junk UI của AI-agent (Business Suite lead bot) ─────────────
+test('AI-agent junk: chip đánh giá + notice tiếp quản + zero-width bị lọc', () => {
+  require('../../src/extension/textFilter.js'); // IIFE gán vào globalThis
+  const f = globalThis.FbCrmTextFilter;
+  const junk = ['Phản hồi tốt', 'Cải thiện phản hồi', 'Bạn đã tiếp quản đoạn chat này từ tác nhân AI.', 'Tác nhân AI sẽ phản hồi', '\u200B', ' \u200B '];
+  for (const j of junk) {
+    assert.equal(f.cleanMessageText(j), '', `junk phải về rỗng: ${JSON.stringify(j)}`);
+    // Zero-width thuần: trim() không bỏ được \u200B - pipeline thật đi qua
+    // cleanMessageText trước (về rỗng -> bị bỏ qua như rác) nên chỉ assert
+    // isSystem cho junk có nội dung nhìn thấy được.
+    const visible = j.replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
+    if (visible) {
+      assert.equal(f.isSystemOrMetadataText(j), true, `junk phải là system: ${JSON.stringify(j)}`);
+    }
+  }
+  // Tin thật phải giữ nguyên
+  assert.equal(f.cleanMessageText('Bao tiền 1 bo'), 'Bao tiền 1 bo');
+  assert.equal(f.cleanMessageText('0398672871 sdt zalo'), '0398672871 sdt zalo');
+});

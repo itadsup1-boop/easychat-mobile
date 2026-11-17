@@ -1,0 +1,939 @@
+import React, { useEffect, useRef, useState } from 'react';
+import { X, ExternalLink, ShieldAlert, RefreshCw, PlusCircle, Trash2, Monitor, Layers, DownloadCloud, CheckCircle2 } from 'lucide-react';
+import ConfirmModal from './ConfirmModal';
+import PageSelectorModal from './PageSelectorModal';
+
+export default function AccountManagerModal({ onClose, onSourcesChanged, onFacebookSyncStart, socket, sessionUser }) {
+  const isCompanyAdmin = sessionUser?.company_role === 'ADMIN';
+  const [accounts, setAccounts] = useState([]);
+  const genericPageName = /^Page \d+$/i;
+  const [loading, setLoading] = useState(true);
+  const [startingId, setStartingId] = useState(null);
+  const [displayActionId, setDisplayActionId] = useState(null);
+  const [deletingId, setDeletingId] = useState(null);
+  const [accountToDelete, setAccountToDelete] = useState(null);
+  const [accountActionError, setAccountActionError] = useState('');
+  const [addingSession, setAddingSession] = useState(false);
+  const [pendingKey, setPendingKey] = useState(null);
+  const [inboxSources, setInboxSources] = useState([]);
+  const [selectedAccountForPages, setSelectedAccountForPages] = useState(null);
+  const [pageToken, setPageToken] = useState('');
+  const [pageOwnerAccountId, setPageOwnerAccountId] = useState('');
+  const [pageConnectError, setPageConnectError] = useState('');
+  const [pageConnectLoading, setPageConnectLoading] = useState(false);
+  const [initialAccountIds, setInitialAccountIds] = useState(null);
+  const [initialDisconnectedAccountIds, setInitialDisconnectedAccountIds] = useState(null);
+  const [vsConfig, setVsConfig] = useState(null);
+  const [vsKeyInput, setVsKeyInput] = useState('');
+  const [vsLimit, setVsLimit] = useState(10);
+  const [vsBusy, setVsBusy] = useState(false);
+  const [vsJob, setVsJob] = useState(null);
+  const [vsError, setVsError] = useState('');
+  const [vsList, setVsList] = useState(null);
+  const [vsListBusy, setVsListBusy] = useState(false);
+  const [vsSelected, setVsSelected] = useState(() => new Set());
+  const [vsDeadSkipped, setVsDeadSkipped] = useState(0);
+
+  // App re-render mỗi giây (đồng hồ + reconcile 1s) làm prop arrow-inline đổi
+  // identity liên tục — nếu đưa thẳng vào deps của effect có setInterval thì
+  // interval bị reset mỗi giây và KHÔNG BAO GIỜ fire (poll import-status chết
+  // đói, spinner treo vĩnh viễn). Giữ callback qua ref để interval ổn định.
+  const onSourcesChangedRef = useRef(onSourcesChanged);
+  useEffect(() => { onSourcesChangedRef.current = onSourcesChanged; }, [onSourcesChanged]);
+
+  const loadInboxSources = async () => {
+    try {
+      const res = await fetch('/api/inbox-sources');
+      const data = await res.json();
+      setInboxSources(Array.isArray(data) ? data : []);
+    } catch {
+      setInboxSources([]);
+    }
+  };
+
+  const loadAccounts = async () => {
+    try {
+      const res = await fetch('/api/accounts');
+      const data = await res.json();
+      setAccounts(data);
+      return data;
+    } catch {
+      setAccounts([]);
+      return [];
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    loadAccounts();
+    loadInboxSources();
+    const interval = setInterval(() => { loadAccounts(); loadInboxSources(); }, 3000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // Lắng nghe ACCOUNT_STATUS_CHANGED từ socket để biết ngay khi tài khoản mới được đăng ký
+  useEffect(() => {
+    if (!socket) return;
+    const handleAccountStatus = (data) => {
+      const belongsToCurrentSetup = Boolean(
+        addingSession && pendingKey && data?.pending_key === pendingKey
+      );
+      const isNewAccount = Boolean(
+        addingSession && initialAccountIds && !initialAccountIds.has(data?.account_id)
+      );
+      if (belongsToCurrentSetup || isNewAccount) {
+        // Tài khoản mới đã được backend xác nhận
+        setAddingSession(false);
+        setPendingKey(null);
+        setInitialAccountIds(null);
+        loadAccounts();
+        onSourcesChanged?.();
+      } else {
+        loadAccounts();
+      }
+    };
+    const handleExtensionConnection = ({ account_id, is_connected }) => {
+      setAccounts((currentAccounts) => currentAccounts.map((account) => (
+        String(account.id) === String(account_id)
+          ? { ...account, is_extension_connected: is_connected === true }
+          : account
+      )));
+      if (
+        addingSession
+        && is_connected === true
+        && initialDisconnectedAccountIds?.has(String(account_id))
+      ) {
+        setAddingSession(false);
+        setPendingKey(null);
+        setInitialAccountIds(null);
+        setInitialDisconnectedAccountIds(null);
+        loadAccounts();
+        onSourcesChanged?.();
+      }
+    };
+    const handleAccountLinkFailed = (data) => {
+      if (!pendingKey || data?.pending_key !== pendingKey) return;
+      setAccountActionError(data.error || 'Không thể liên kết tài khoản Facebook');
+      setAddingSession(false);
+      setPendingKey(null);
+      setInitialAccountIds(null);
+    };
+    socket.on('ACCOUNT_STATUS_CHANGED', handleAccountStatus);
+    socket.on('EXTENSION_CONNECTION_CHANGED', handleExtensionConnection);
+    socket.on('ACCOUNT_LINK_FAILED', handleAccountLinkFailed);
+    return () => {
+      socket.off('ACCOUNT_STATUS_CHANGED', handleAccountStatus);
+      socket.off('EXTENSION_CONNECTION_CHANGED', handleExtensionConnection);
+      socket.off('ACCOUNT_LINK_FAILED', handleAccountLinkFailed);
+    };
+  }, [socket, addingSession, pendingKey, initialAccountIds, initialDisconnectedAccountIds, onSourcesChanged]);
+
+  // Socket events can arrive before the POST /new-session response updates
+  // pendingKey. Polling already refreshes accounts, so use that data as a
+  // reliable fallback when an existing disconnected account reconnects.
+  useEffect(() => {
+    if (!addingSession || !initialDisconnectedAccountIds) return;
+    const reconnected = accounts.some((account) => (
+      account.is_extension_connected === true
+      && initialDisconnectedAccountIds.has(String(account.id))
+    ));
+    if (!reconnected) return;
+    setAddingSession(false);
+    setPendingKey(null);
+    setInitialAccountIds(null);
+    setInitialDisconnectedAccountIds(null);
+    onSourcesChanged?.();
+  }, [accounts, addingSession, initialDisconnectedAccountIds, onSourcesChanged]);
+
+  useEffect(() => {
+    if (!addingSession || !pendingKey) return;
+    let stopped = false;
+    const checkCompletion = async () => {
+      try {
+        const res = await fetch(`/api/facebook-setup/${encodeURIComponent(pendingKey)}/status`);
+        const data = await res.json();
+        if (stopped || !res.ok || data?.completed !== true) return;
+        setAddingSession(false);
+        setPendingKey(null);
+        setInitialAccountIds(null);
+        setInitialDisconnectedAccountIds(null);
+        await loadAccounts();
+        onSourcesChanged?.();
+      } catch (_) {}
+    };
+    checkCompletion();
+    const timer = setInterval(checkCompletion, 1500);
+    return () => {
+      stopped = true;
+      clearInterval(timer);
+    };
+  }, [addingSession, pendingKey, onSourcesChanged]);
+
+  // ── Viet Seeding: config + tiến trình nhập ──
+  useEffect(() => {
+    if (!isCompanyAdmin) return;
+    let stopped = false;
+    (async () => {
+      try {
+        const res = await fetch('/api/accounts/vietseeding/config');
+        const data = await res.json();
+        if (!stopped && res.ok) setVsConfig({ configured: Boolean(data.configured), api_key_masked: data.api_key_masked });
+      } catch (_) {}
+      try {
+        const res = await fetch('/api/accounts/vietseeding/import-status');
+        const data = await res.json();
+        if (!stopped && data?.job) setVsJob(data.job);
+      } catch (_) {}
+    })();
+    return () => { stopped = true; };
+  }, [isCompanyAdmin]);
+
+  useEffect(() => {
+    if (!vsJob || vsJob.status !== 'RUNNING') return;
+    let stopped = false;
+    let failCount = 0;
+    const endLocalJob = (error) => {
+      if (stopped) return;
+      stopped = true;
+      clearInterval(timer);
+      setVsJob((j) => (j && j.status === 'RUNNING' ? { ...j, status: 'FAILED', error } : j));
+    };
+    const timer = setInterval(async () => {
+      try {
+        const res = await fetch('/api/accounts/vietseeding/import-status');
+        const data = await res.json().catch(() => ({}));
+        if (stopped) return;
+        if (!res.ok || !data?.job) {
+          // Server không còn job nào trong lúc local đang RUNNING: app đã restart
+          // hoặc đợt nhập mất — kết thúc spinner thay vì quay vô hạn.
+          failCount += 1;
+          if (failCount >= 3) endLocalJob('Mất liên lạc với đợt nhập (app có thể đã khởi động lại). Kiểm tra danh sách tài khoản.');
+          return;
+        }
+        failCount = 0;
+        setVsJob(data.job);
+        if (data.job.status !== 'RUNNING') {
+          loadAccounts();
+          onSourcesChangedRef.current?.();
+        }
+      } catch (_) {
+        failCount += 1;
+        if (failCount >= 5) endLocalJob('Không truy vấn được tiến trình nhập — kiểm tra kết nối rồi thử lại.');
+      }
+    }, 2000);
+    return () => {
+      stopped = true;
+      clearInterval(timer);
+    };
+  }, [vsJob?.id, vsJob?.status]);
+
+  const handleSaveVsKey = async () => {
+    setVsError('');
+    if (!vsKeyInput.trim()) {
+      setVsError('Nhập API key trước khi lưu.');
+      return;
+    }
+    setVsBusy(true);
+    try {
+      const res = await fetch('/api/accounts/vietseeding/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ api_key: vsKeyInput.trim() })
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) throw new Error(data.error || 'Không lưu được API key');
+      setVsConfig({ configured: true, api_key_masked: data.api_key_masked });
+      setVsKeyInput('');
+    } catch (err) {
+      setVsError(err.message);
+    } finally {
+      setVsBusy(false);
+    }
+  };
+
+  const handleVsFetchList = async () => {
+    setVsError('');
+    setVsListBusy(true);
+    try {
+      const res = await fetch('/api/accounts/vietseeding/list-accounts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ limit: Math.max(1, Math.min(100, Number(vsLimit) || 10)) })
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) throw new Error(data.error || 'Không lấy được danh sách tài khoản');
+      setVsList(data.accounts || []);
+      setVsDeadSkipped(data.dead_skipped || 0);
+      setVsSelected(new Set());
+    } catch (err) {
+      setVsError(err.message);
+    } finally {
+      setVsListBusy(false);
+    }
+  };
+
+  const toggleVsSelected = (identifier) => {
+    setVsSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(identifier)) next.delete(identifier);
+      else next.add(identifier);
+      return next;
+    });
+  };
+
+  const toggleVsAll = () => {
+    setVsSelected((prev) => {
+      // "Chọn tất cả" chỉ tick các tk CHƯA có trong CRM — tk đã có sẵn server
+      // cũng bỏ qua (EXISTS) nên tick vào chỉ gây nhiễu kết quả.
+      const importableIds = (vsList || [])
+        .filter((a) => !accounts.some((acc) => String(acc.id) === String(a.identifier)))
+        .map((a) => a.identifier);
+      const allSelected = importableIds.length > 0 && importableIds.every((id) => prev.has(id));
+      return allSelected ? new Set() : new Set(importableIds);
+    });
+  };
+
+  const handleVsImport = async () => {
+    const selected = [...vsSelected];
+    if (!selected.length) {
+      setVsError('Chọn ít nhất một tài khoản trong danh sách trước khi nhập.');
+      return;
+    }
+    setVsError('');
+    setVsBusy(true);
+    try {
+      const res = await fetch('/api/accounts/vietseeding/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ identifiers: selected })
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) throw new Error(data.error || 'Không bắt đầu được đợt nhập');
+      setVsJob({
+        id: data.job_id,
+        status: 'RUNNING',
+        total: 0,
+        processed: 0,
+        imported: 0,
+        skipped: 0,
+        failed: 0,
+        current: null,
+        results: [],
+        note: null,
+        error: null
+      });
+    } catch (err) {
+      setVsError(err.message);
+    } finally {
+      setVsBusy(false);
+    }
+  };
+
+  const handleAddNewAccount = async () => {
+    setAccountActionError('');
+    const currentAccounts = await loadAccounts();
+    const currentIds = new Set(currentAccounts.map((a) => a.id));
+    const disconnectedIds = new Set(
+      currentAccounts
+        .filter((account) => account.is_extension_connected !== true)
+        .map((account) => String(account.id))
+    );
+    setInitialAccountIds(currentIds);
+    setInitialDisconnectedAccountIds(disconnectedIds);
+    setAddingSession(true);
+    try {
+      const res = await fetch('/api/accounts/new-session', { method: 'POST' });
+      const data = await res.json();
+      if (res.ok && data.success) {
+        setPendingKey(data.pending_key);
+      } else {
+        setAccountActionError(data.error || 'Không thể mở Chrome để thêm tài khoản Facebook');
+        setAddingSession(false);
+        setInitialAccountIds(null);
+        setInitialDisconnectedAccountIds(null);
+      }
+    } catch (e) {
+      console.error(e);
+      setAccountActionError(e.message || 'Không thể kết nối backend để thêm tài khoản');
+      setAddingSession(false);
+      setInitialAccountIds(null);
+      setInitialDisconnectedAccountIds(null);
+    }
+  };
+
+  const handleStartChrome = async (accountId) => {
+    setStartingId(accountId);
+    onFacebookSyncStart?.(accountId, true);
+    try {
+      const res = await fetch(`/api/accounts/${accountId}/start`, { method: 'POST' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success) throw new Error(data.error || 'Không thể mở Chrome');
+      await loadAccounts();
+    } catch (error) {
+      onFacebookSyncStart?.(accountId, false);
+      setAccountActionError(error.message || 'Không thể mở Chrome');
+    } finally {
+      setStartingId(null);
+    }
+  };
+
+  const handleChromeDisplayChange = async (account, nextVisible) => {
+    const accountId = String(account.id);
+    const shouldStartChrome = nextVisible && account.is_chrome_running !== true;
+    setAccountActionError('');
+    setDisplayActionId(accountId);
+    setAccounts((current) => current.map((item) => (
+      String(item.id) === accountId
+        ? {
+            ...item,
+            is_chrome_running: nextVisible ? true : item.is_chrome_running,
+            chrome_display_mode: nextVisible ? 'VISIBLE' : 'BACKGROUND'
+          }
+        : item
+    )));
+    if (shouldStartChrome) onFacebookSyncStart?.(accountId, true);
+    try {
+      if (shouldStartChrome) {
+        const startRes = await fetch(`/api/accounts/${encodeURIComponent(accountId)}/start`, { method: 'POST' });
+        const startData = await startRes.json().catch(() => ({}));
+        if (!startRes.ok || !startData.success) throw new Error(startData.error || 'Không thể khởi động Chrome');
+      }
+      const action = nextVisible ? 'open' : 'background';
+      const res = await fetch(`/api/accounts/${encodeURIComponent(accountId)}/${action}`, { method: 'POST' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success) throw new Error(data.error || 'Không thể đổi chế độ hiển thị Chrome');
+      await loadAccounts();
+    } catch (error) {
+      if (shouldStartChrome) onFacebookSyncStart?.(accountId, false);
+      await loadAccounts();
+      setAccountActionError(error.message || 'Không thể đổi chế độ hiển thị Chrome');
+    } finally {
+      setDisplayActionId(null);
+    }
+  };
+  const handleDeleteAccount = (account) => {
+    setAccountToDelete(account);
+  };
+
+  const executeDeleteAccount = async () => {
+    if (!accountToDelete) return;
+    const account = accountToDelete;
+    setAccountActionError('');
+    setDeletingId(account.id);
+    try {
+      const res = await fetch(`/api/accounts/${encodeURIComponent(account.id)}`, { method: 'DELETE' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success) {
+        throw new Error(data.error || 'Không thể xóa tài khoản');
+      }
+      setAccounts((currentAccounts) => currentAccounts.filter(
+        (currentAccount) => String(currentAccount.id) !== String(account.id)
+      ));
+      await loadInboxSources();
+      onSourcesChanged?.();
+      setAccountToDelete(null);
+    } catch (error) {
+      setAccountActionError(error.message || 'Không thể xóa tài khoản');
+    } finally {
+      setDeletingId(null);
+    }
+  };
+
+  const handleConnectPage = async () => {
+    setPageConnectError('');
+    if (!pageToken.trim()) {
+      setPageConnectError('Thiếu Page access token');
+      return;
+    }
+    setPageConnectLoading(true);
+    try {
+      const res = await fetch('/api/inbox-sources/page', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ page_access_token: pageToken.trim(), owner_account_id: pageOwnerAccountId || null })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Không kết nối được Page');
+      setPageToken('');
+      await loadInboxSources();
+      onSourcesChanged?.();
+    } catch (err) {
+      setPageConnectError(err.message);
+    } finally {
+      setPageConnectLoading(false);
+    }
+  };
+
+  const handleDisconnectSource = async (sourceId) => {
+    if (!window.confirm('Ngắt nguồn này? CRM sẽ ngừng nhận tin nhắn mới từ Fanpage (tin cũ vẫn giữ).')) return;
+    try {
+      const res = await fetch(`/api/inbox-sources/${sourceId}`, { method: 'DELETE' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || 'Không ngắt được nguồn');
+      await loadInboxSources();
+      onSourcesChanged?.();
+    } catch (err) {
+      window.alert('Ngắt nguồn thất bại: ' + err.message);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/75 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="w-full max-w-lg bg-slate-900 border border-slate-800 rounded-xl shadow-2xl overflow-hidden" onClick={(e) => e.stopPropagation()}>
+        {/* Header */}
+        <div className="flex items-center justify-between px-5 py-4 border-b border-slate-800">
+          <div className="flex items-center gap-2">
+            <ShieldAlert size={18} className="text-slate-300" />
+            <h3 className="text-xs font-semibold text-slate-100 uppercase tracking-wider">Quản lý Tài khoản Facebook &amp; Checkpoint</h3>
+          </div>
+          <button onClick={onClose} className="text-slate-500 hover:text-slate-300 p-1">
+            <X size={16} />
+          </button>
+        </div>
+
+        {/* Content */}
+        <div className="p-5 space-y-4 max-h-[70vh] overflow-y-auto">
+          <div className={'flex items-center justify-between gap-3 ' + (!isCompanyAdmin ? 'hidden' : '')}>
+            <p className="text-xs text-slate-400 leading-relaxed flex-1">
+              Mở cửa sổ Chrome Portable để kết nối tài khoản mới hoặc xử lý Checkpoint/OTP 2FA.
+            </p>
+            <button
+              onClick={handleAddNewAccount}
+              disabled={addingSession}
+              className="px-3 py-2 bg-[var(--color-accent)] hover:bg-[var(--color-accent-hover)] disabled:opacity-50 text-[var(--color-text-on-accent)] rounded-xl text-xs font-bold flex items-center gap-1.5 shrink-0 transition-colors shadow-sm"
+            >
+              {addingSession ? (
+                <>
+                  <RefreshCw size={14} className="animate-spin" />
+                  <span>{pendingKey ? 'Đang chờ đăng nhập...' : 'Đang mở Chrome...'}</span>
+                </>
+              ) : (
+                <>
+                  <PlusCircle size={15} />
+                  <span>+ Thêm tài khoản Facebook</span>
+                </>
+              )}
+            </button>
+          </div>
+
+          {addingSession && pendingKey && (
+            <div className="p-3 bg-sky-950/40 border border-sky-500/30 rounded-xl flex items-center justify-between gap-2.5 text-xs text-sky-200">
+              <div className="flex items-start gap-2.5">
+                <RefreshCw size={15} className="animate-spin text-sky-400 shrink-0 mt-0.5" />
+                <div>
+                  <p className="font-semibold text-sky-300">Đang chờ đăng nhập Facebook...</p>
+                  <p className="text-[11px] text-sky-300/80 mt-0.5">
+                    Tiện ích đã được cài tự động. Hãy đăng nhập và nhập PIN; CRM sẽ tự nhận tài khoản khi hoàn tất.
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => { setAddingSession(false); setPendingKey(null); setInitialAccountIds(null); }}
+                className="px-2 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded text-[11px] font-medium shrink-0 border border-slate-700/60 transition-colors"
+              >
+                Hủy
+              </button>
+            </div>
+          )}
+
+          {/* Viet Seeding: nhập account hàng loạt bằng cookie từ API */}
+          {isCompanyAdmin && (
+            <div className="border-t border-slate-800 pt-4 space-y-2">
+              <div className="flex items-center justify-between gap-2">
+                <h4 className="text-xs font-semibold text-slate-100 uppercase tracking-wider flex items-center gap-1.5">
+                  <DownloadCloud size={14} className="text-emerald-400" />
+                  <span>Nhập từ Viet Seeding</span>
+                </h4>
+                {vsConfig?.configured && (
+                  <span className="text-[10px] text-emerald-400 font-mono">key: {vsConfig.api_key_masked}</span>
+                )}
+              </div>
+              <p className="text-[11px] text-slate-500 leading-relaxed">
+                Lấy danh sách tài khoản từ API Viet Seeding (tk die bị loại sẵn theo trạng thái live), tích chọn
+                tk muốn nhập rồi bấm nhập. Chrome sẽ mở lần lượt từng tk đã chọn — không cần gõ mật khẩu,
+                không cần OTP nếu cookie còn sống.
+              </p>
+              <div className="flex items-center gap-2">
+                <input
+                  type="password"
+                  value={vsKeyInput}
+                  onChange={(e) => setVsKeyInput(e.target.value)}
+                  placeholder={vsConfig?.configured ? 'Đã lưu key — nhập key mới để thay thế' : 'API key Viet Seeding (Bearer)'}
+                  className="flex-1 min-w-0 px-2.5 py-1.5 bg-slate-950 border border-slate-700/60 rounded-md text-xs text-slate-200 placeholder:text-slate-600 focus:outline-none focus:border-slate-500"
+                />
+                <button
+                  type="button"
+                  onClick={handleSaveVsKey}
+                  disabled={vsBusy || !vsKeyInput.trim()}
+                  className="px-2.5 py-1.5 rounded-md text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700/60 transition-colors disabled:opacity-40 shrink-0"
+                >
+                  Lưu key
+                </button>
+              </div>
+              <div className="flex items-center gap-2">
+                <label className="text-[11px] text-slate-400 shrink-0" title="Số tk lấy từ API mỗi lần bấm">Số lượng</label>
+                <input
+                  type="number"
+                  min={1}
+                  max={100}
+                  value={vsLimit}
+                  onChange={(e) => setVsLimit(e.target.value)}
+                  className="w-16 px-2 py-1.5 bg-slate-950 border border-slate-700/60 rounded-md text-xs text-slate-200 focus:outline-none focus:border-slate-500"
+                />
+                <button
+                  type="button"
+                  onClick={handleVsFetchList}
+                  disabled={vsListBusy || vsBusy || vsJob?.status === 'RUNNING'}
+                  className="flex-1 px-3 py-1.5 rounded-md text-xs font-bold bg-sky-600 hover:bg-sky-500 text-white transition-colors disabled:opacity-50 flex items-center justify-center gap-1.5"
+                >
+                  {vsListBusy
+                    ? (<><RefreshCw size={13} className="animate-spin" /><span>Đang lấy danh sách…</span></>)
+                    : (<><RefreshCw size={13} /><span>Lấy danh sách tài khoản</span></>)}
+                </button>
+              </div>
+
+              {vsList && (
+                <div className="rounded-lg border border-slate-800 bg-slate-950/60 p-2 space-y-1.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <label className="flex items-center gap-1.5 text-[11px] text-slate-300 cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        className="accent-emerald-500"
+                        checked={(vsList || []).length > 0 && (vsList || []).every((a) => vsSelected.has(a.identifier))}
+                        onChange={toggleVsAll}
+                      />
+                      <span>Chọn tất cả ({(vsList || []).length} live{vsSelected.size ? ` · đã tích ${vsSelected.size}` : ''})</span>
+                    </label>
+                    <span className="text-[10px] text-slate-500 shrink-0">
+                      {vsDeadSkipped > 0 ? `bỏ qua ${vsDeadSkipped} tk die` : 'không có tk die'}
+                    </span>
+                  </div>
+                  <div className="max-h-40 overflow-y-auto space-y-0.5 pr-1">
+                    {vsList.map((a) => {
+                      // Tag + tên tính LIVE theo accounts hiện tại của CRM (refresh 3s):
+                      // xóa tk khỏi CRM là row tự về "live" và hiện tên từ API (nếu có).
+                      const crmAccount = accounts.find((acc) => String(acc.id) === String(a.identifier));
+                      const name = a.name || crmAccount?.name || null;
+                      return (
+                        <label key={a.identifier} className="flex items-center gap-2 rounded px-1 py-0.5 hover:bg-slate-900 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            className="accent-emerald-500 shrink-0"
+                            checked={vsSelected.has(a.identifier)}
+                            onChange={() => toggleVsSelected(a.identifier)}
+                          />
+                          <span className="font-mono text-[11px] text-slate-400 truncate">{a.identifier}</span>
+                          {name && <span className="text-[11px] text-slate-200 truncate flex-1 min-w-0" title={name}>{name}</span>}
+                          <span className={'ml-auto shrink-0 text-[10px] ' + (crmAccount ? 'text-sky-400' : 'text-emerald-400')}>
+                            {crmAccount ? 'đã có sẵn' : (a.status || 'live')}
+                          </span>
+                        </label>
+                      );
+                    })}
+                    {!vsList.length && (
+                      <div className="text-[11px] text-slate-500 px-1 py-2">API không có tài khoản live nào trong lô này.</div>
+                    )}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleVsImport}
+                    disabled={vsBusy || vsJob?.status === 'RUNNING' || vsSelected.size === 0}
+                    className="w-full px-3 py-1.5 rounded-md text-xs font-bold bg-emerald-600 hover:bg-emerald-500 text-white transition-colors disabled:opacity-50 flex items-center justify-center gap-1.5"
+                  >
+                    {vsJob?.status === 'RUNNING'
+                      ? (<><RefreshCw size={13} className="animate-spin" /><span>Đang nhập…</span></>)
+                      : (<><DownloadCloud size={13} /><span>Nhập {vsSelected.size} tài khoản đã chọn</span></>)}
+                  </button>
+                </div>
+              )}
+
+              {vsJob && (
+                <div className="p-2.5 rounded-lg border border-slate-800 bg-slate-950/60 text-[11px] space-y-1.5">
+                  <div className="flex items-center justify-between gap-2 text-slate-300">
+                    <span className="flex items-center gap-1.5 min-w-0">
+                      {vsJob.status === 'RUNNING'
+                        ? <RefreshCw size={12} className="animate-spin text-emerald-400 shrink-0" />
+                        : vsJob.status === 'FAILED'
+                          ? <X size={12} className="text-red-400 shrink-0" />
+                          : <CheckCircle2 size={12} className="text-emerald-400 shrink-0" />}
+                      <span className="truncate">
+                        {vsJob.status === 'RUNNING'
+                          ? (vsJob.phase === 'FETCH'
+                            ? 'Đang lấy cookie từ Viet Seeding…'
+                            : (vsJob.total
+                              ? `Đang nhập ${vsJob.processed}/${vsJob.total}${vsJob.current ? `: ${vsJob.current}` : ''}`
+                              : 'Đang lấy danh sách cookie từ Viet Seeding…'))
+                          : vsJob.status === 'FAILED'
+                            ? 'Đợt nhập thất bại'
+                            : (vsJob.note || `Hoàn tất: ${vsJob.imported} mới · ${vsJob.skipped || 0} đã có sẵn (bỏ qua) · ${vsJob.failed} lỗi`)}
+                      </span>
+                    </span>
+                    {vsJob.status !== 'RUNNING' && (
+                      <button type="button" onClick={() => setVsJob(null)} className="text-slate-500 hover:text-slate-300 shrink-0" aria-label="Ẩn tiến trình">
+                        <X size={12} />
+                      </button>
+                    )}
+                  </div>
+                  {vsJob.error && <div className="text-red-400">{vsJob.error}</div>}
+                  {vsJob.results?.length > 0 && (
+                    <div className="max-h-24 overflow-y-auto space-y-0.5 pr-1">
+                      {vsJob.results.map((r, i) => (
+                        <div key={`${r.identifier}-${i}`} className="flex items-center justify-between gap-2">
+                          <span className="truncate font-mono text-slate-500">{r.identifier}</span>
+                          <span className={`shrink-0 truncate max-w-[60%] ${
+                            r.status === 'IMPORTED' ? 'text-emerald-400' : r.status === 'EXISTS' ? 'text-sky-400' : 'text-red-400'
+                          }`}>
+                            {r.status === 'IMPORTED'
+                              ? `đã nhập${r.name ? ` · ${r.name}` : ''}`
+                              : r.status === 'EXISTS'
+                                ? 'đã có sẵn'
+                                : (r.error || 'lỗi')}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {vsError && (
+                <div className="text-[11px] text-red-400 bg-red-500/10 border border-red-500/20 rounded-lg px-3 py-2">
+                  {vsError}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Danh sách Fanpage Messenger đang kết nối */}
+          <div className={'border-t border-slate-800 pt-4 space-y-3 ' + (!isCompanyAdmin ? 'hidden' : '')}>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="min-w-0 flex-1">
+                <h4 className="text-xs font-semibold text-slate-100 uppercase tracking-wider flex items-center gap-1.5">
+                  <Layers size={14} className="text-sky-400" />
+                  <span>Fanpage Messenger Đang Kết Nối</span>
+                </h4>
+                <p className="text-[11px] text-slate-500 mt-0.5">
+                  Nhập trực tiếp Page/User Access Token, cấu hình Webhook hoặc quản lý Fanpage qua Messenger Platform API.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setSelectedAccountForPages(accounts[0] || { id: 'page_workspace', name: 'Kho Fanpage EasyChat' })}
+                className="px-3 py-2 rounded-xl text-xs font-bold bg-sky-600 hover:bg-sky-500 text-white flex items-center gap-1.5 shrink-0 transition-colors shadow-sm"
+              >
+                <Layers size={14} />
+                <span>Quản lý Fanpage &amp; Nhập Token</span>
+              </button>
+            </div>
+            
+            <div className="space-y-2">
+              {inboxSources.filter((source) => source.source_type === 'page_messenger').length === 0 ? (
+                <div className="p-3.5 rounded-lg border border-slate-800/80 bg-slate-950/40 text-center text-xs text-slate-500">
+                  Chưa có Fanpage nào được mở. Bấm "Quản lý Fanpage" ở tài khoản Facebook bên dưới để chọn các trang cần trực.
+                </div>
+              ) : (
+                inboxSources.filter((source) => source.source_type === 'page_messenger').map((source) => (
+                  <div key={source.id} className="p-3 rounded-lg border border-sky-500/20 bg-sky-500/5 flex items-center justify-between gap-3">
+                    <div className="flex items-center gap-2.5 min-w-0">
+                      <span className="relative w-9 h-9 shrink-0 overflow-hidden rounded-full bg-sky-500/20 text-sky-200 font-bold text-xs flex items-center justify-center border border-sky-500/30">
+                        {(source.display_name || 'P').replace(/^Page\s*/i, '').charAt(0).toUpperCase()}
+                        {source.avatar_url && <img src={source.avatar_url} alt="" className="absolute inset-0 h-full w-full object-cover" onError={(event) => { event.currentTarget.style.display = 'none'; }} />}
+                      </span>
+                      <div className="min-w-0">
+                        <div className="text-xs font-semibold text-slate-100 truncate">{source.display_name && !genericPageName.test(source.display_name) ? source.display_name : 'Page · ' + (source.display_name || source.external_id)}</div>
+                        <div className="text-[10px] text-slate-500 font-mono truncate">ID: {source.external_id} · {source.status === 'ACTIVE' ? '🟢 Hoạt động' : source.status === 'DISCONNECTED' ? '🔴 Đã ngắt' : source.status}</div>
+                      </div>
+                    </div>
+                    {source.status === 'ACTIVE' && (
+                      <button type="button" onClick={() => handleDisconnectSource(source.id)} className="px-2.5 py-1 rounded-md bg-slate-800 hover:bg-slate-700 text-[11px] text-slate-300 border border-slate-700/60 transition-colors">Ngắt</button>
+                    )}
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+
+          {/* Danh sách tài khoản cá nhân */}
+          {accountActionError && (
+            <div className="text-[11px] text-red-400 bg-red-500/10 border border-red-500/20 rounded-lg px-3 py-2">
+              {accountActionError}
+            </div>
+          )}
+          {loading ? (
+            <div className="py-8 text-center text-slate-500 text-xs flex items-center justify-center gap-2">
+              <RefreshCw size={14} className="animate-spin" /> Đang tải danh sách...
+            </div>
+          ) : accounts.length === 0 ? (
+            <div className="py-8 text-center text-slate-500 text-xs">
+              {isCompanyAdmin
+                ? 'Chưa có tài khoản Facebook kết nối. Bấm "+ Thêm tài khoản Facebook" để kết nối tài khoản đầu tiên.'
+                : 'Admin doanh nghiệp chưa cấp tài khoản Facebook cho bạn.'}
+            </div>
+          ) : (
+            <div className="space-y-2.5">
+              {accounts.map((acc) => {
+                const isCheckpoint = acc.status === 'CHECKPOINT';
+                const isConnected = acc.is_extension_connected === true;
+                const isChromeVisible = acc.is_chrome_running === true && acc.chrome_display_mode === 'VISIBLE';
+                const isChangingDisplay = displayActionId === String(acc.id);
+                return (
+                  <div
+                    key={acc.id}
+                    className={`p-3.5 rounded-lg border ${
+                      isCheckpoint ? 'bg-slate-950 border-red-500/40' : 'bg-slate-950 border-slate-800'
+                    }`}
+                  >
+                    <div className="flex items-start gap-3 min-w-0">
+                      <div className="relative w-10 h-10 shrink-0 overflow-hidden rounded-full bg-slate-800 text-slate-300 font-semibold text-xs flex items-center justify-center border border-slate-700/50">
+                        {(acc.name || 'F').charAt(0).toUpperCase()}
+                        {acc.avatar_url && <img src={acc.avatar_url} alt="" className="absolute inset-0 h-full w-full object-cover" onError={(event) => { event.currentTarget.style.display = 'none'; }} />}
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <h4 className="text-xs font-semibold text-slate-100 break-words">{acc.name || 'Tài khoản Facebook'}</h4>
+                        <div className="text-[10px] text-slate-500 font-mono mt-0.5 break-all">ID: {acc.id}</div>
+                        <div className="flex flex-wrap items-center gap-1.5 mt-1.5">
+                          <span
+                            className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${
+                              isConnected
+                                ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20'
+                                : 'bg-slate-500/10 text-slate-400 border border-slate-500/20'
+                            }`}
+                          >
+                            {isConnected ? 'Đã kết nối' : 'Chưa kết nối'}
+                          </span>
+                          {acc.is_chrome_running && (
+                            <span className="text-[10px] px-1.5 py-0.5 rounded font-medium bg-sky-500/10 text-sky-400 border border-sky-500/20">
+                              Chrome đang chạy
+                            </span>
+                          )}
+                          {isCheckpoint && (
+                            <span className="text-[10px] px-1.5 py-0.5 rounded font-medium bg-red-500/10 text-red-400 border border-red-500/20">
+                              Checkpoint / 2FA
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="mt-3 pt-3 border-t border-slate-800/80 flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <Monitor size={14} className={isChromeVisible ? 'text-sky-400' : 'text-slate-500'} />
+                        <span className="text-[11px] text-slate-300">Hiện Chrome</span>
+                        <button
+                          type="button"
+                          role="switch"
+                          aria-checked={isChromeVisible}
+                          aria-label={`${isChromeVisible ? 'Ẩn' : 'Hiện'} Chrome của ${acc.name || acc.id}`}
+                          title={isChromeVisible ? 'OFF: Ẩn cửa sổ Chrome' : 'ON: Mở Chrome ra màn hình'}
+                          onClick={() => handleChromeDisplayChange(acc, !isChromeVisible)}
+                          disabled={isChangingDisplay || deletingId === acc.id}
+                          className={`relative inline-flex h-6 w-12 shrink-0 items-center rounded-full border transition-colors disabled:opacity-40 ${
+                            isChromeVisible
+                              ? 'bg-sky-500 border-sky-400'
+                              : 'bg-slate-800 border-slate-700'
+                          }`}
+                        >
+                          <span className={`absolute text-[8px] font-bold ${isChromeVisible ? 'left-1 text-white' : 'right-1 text-slate-400'}`}>
+                            {isChangingDisplay ? '...' : (isChromeVisible ? 'ON' : 'OFF')}
+                          </span>
+                          <span className={`h-4 w-4 rounded-full bg-white shadow transition-transform ${isChromeVisible ? 'translate-x-7' : 'translate-x-1'}`} />
+                        </button>
+                      </div>
+
+                      <div className="flex items-center gap-1.5 shrink-0 ml-auto">
+                        <button
+                          type="button"
+                          onClick={() => setSelectedAccountForPages(acc)}
+                          className="px-2.5 py-1.5 rounded-md text-xs font-medium flex items-center gap-1.5 transition-colors border bg-sky-500/10 hover:bg-sky-500/20 text-sky-400 border-sky-500/30"
+                          title="Quản lý và mở các Fanpage của tài khoản này"
+                        >
+                          <Layers size={13} />
+                          <span>Fanpage</span>
+                          {inboxSources.filter((s) => s.source_type === 'page_messenger' && String(s.owner_account_id) === String(acc.id)).length > 0 && (
+                            <span className="px-1.5 py-0.2 rounded-full text-[10px] font-bold bg-sky-500/25 text-sky-200">
+                              {inboxSources.filter((s) => s.source_type === 'page_messenger' && String(s.owner_account_id) === String(acc.id)).length}
+                            </span>
+                          )}
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => handleStartChrome(acc.id)}
+                          disabled={startingId === acc.id || deletingId === acc.id || isChangingDisplay || isConnected}
+                          title={isConnected ? 'Tài khoản đã kết nối — không cần mở lại Chrome' : undefined}
+                          className={`px-3 py-1.5 rounded-md text-xs font-medium flex items-center gap-1.5 transition-colors border disabled:opacity-50 ${
+                            isCheckpoint
+                              ? 'bg-red-600 hover:bg-red-500 text-white border-red-500'
+                              : 'bg-slate-800 hover:bg-slate-700 text-slate-200 border-slate-700/60'
+                          }`}
+                        >
+                          {startingId === acc.id ? <RefreshCw size={13} className="animate-spin" /> : <ExternalLink size={13} />}
+                          <span>{startingId === acc.id ? 'Đang kết nối...' : (isConnected ? 'Đã kết nối' : (isCompanyAdmin ? 'Kết nối Facebook' : 'Kết nối'))}</span>
+                        </button>
+                        {isCompanyAdmin && <button
+                          type="button"
+                          onClick={() => handleDeleteAccount(acc)}
+                          disabled={deletingId === acc.id || startingId === acc.id || isChangingDisplay}
+                          aria-label={`Xóa tài khoản ${acc.name || acc.id}`}
+                          title="Xóa tài khoản khỏi CRM"
+                          className="p-1.5 rounded-md text-red-400 bg-red-500/10 hover:bg-red-500/20 border border-red-500/20 transition-colors disabled:opacity-50"
+                        >
+                          {deletingId === acc.id
+                            ? <RefreshCw size={13} className="animate-spin" />
+                            : <Trash2 size={13} />}
+                        </button>}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+
+        {/* Footer */}
+        <div className="px-5 py-3 border-t border-slate-800 bg-slate-950/40 text-right">
+          <button
+            onClick={onClose}
+            className="px-3.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-md text-xs font-medium transition-colors border border-slate-700/60"
+          >
+            Đóng
+          </button>
+        </div>
+      </div>
+
+      <ConfirmModal
+        isOpen={Boolean(accountToDelete)}
+        title="Xóa tài khoản Facebook"
+        message={
+          accountToDelete
+            ? `Bạn có chắc chắn muốn xóa tài khoản "${accountToDelete.name || accountToDelete.id}" khỏi CRM?\n\n` +
+              '• Hội thoại, tin nhắn và cấu hình riêng của tài khoản này sẽ bị xóa vĩnh viễn.\n' +
+              '• Thư mục Chrome profile của tài khoản cũng sẽ được dọn dẹp khỏi máy tính.'
+            : ''
+        }
+        confirmText="Xóa tài khoản"
+        cancelText="Hủy"
+        variant="danger"
+        isLoading={Boolean(deletingId)}
+        onConfirm={executeDeleteAccount}
+        onClose={() => !deletingId && setAccountToDelete(null)}
+      />
+
+      {selectedAccountForPages && (
+        <PageSelectorModal
+          account={selectedAccountForPages}
+          onClose={() => {
+            setSelectedAccountForPages(null);
+            loadInboxSources();
+            loadAccounts();
+          }}
+          onSourcesChanged={onSourcesChanged}
+          socket={socket}
+        />
+      )}
+    </div>
+  );
+}

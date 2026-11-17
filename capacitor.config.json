@@ -1,0 +1,10 @@
+{
+  "appId": "com.easychat.crm.mobile",
+  "appName": "EasyChat",
+  "webDir": "dist/client",
+  "bundledWebRuntime": false,
+  "server": {
+    "androidScheme": "https",
+    "cleartext": true
+  }
+}

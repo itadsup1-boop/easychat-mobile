@@ -1,0 +1,63 @@
+{
+  "name": "autochatbot-fb-crm",
+  "version": "1.0.40",
+  "description": "FB Personal Messenger CRM - Desktop Application",
+  "author": "Adsup <contact@adsup.vn>",
+  "main": "src/electron.js",
+  "scripts": {
+    "start": "node src/server/index.js",
+    "dev:server": "node src/server/index.js",
+    "dev:ui": "vite",
+    "build:ui": "vite build",
+    "build:bytecode": "node scripts/build-bytecode.js",
+    "build:extension": "node scripts/obfuscate-extension.js",
+    "build:all": "npm run build:ui && npm run build:bytecode && npm run build:extension",
+    "release:update": "node scripts/publish-update.js",
+    "release:push": "node scripts/publish-update.js --push",
+    "dist": "npm run build:all && node scripts/rebuild-native-for-electron.js prepare && node scripts/rebuild-native-for-electron.js verify && electron-builder && node scripts/rebuild-native-for-electron.js restore",
+    "dist:win": "npm run build:all && node scripts/rebuild-native-for-electron.js prepare && node scripts/rebuild-native-for-electron.js verify && electron-builder --win && node scripts/rebuild-native-for-electron.js restore",
+    "dist:linux": "npm run build:all && node scripts/rebuild-native-for-electron.js prepare && node scripts/rebuild-native-for-electron.js verify && electron-builder --linux && node scripts/rebuild-native-for-electron.js restore",
+    "dist:mac": "npm run build:all && node scripts/rebuild-native-for-electron.js prepare && node scripts/rebuild-native-for-electron.js verify && electron-builder --mac && node scripts/rebuild-native-for-electron.js restore",
+    "fetch-chrome:win": "node chrome-bundling/fetchChromeForTesting.js win64",
+    "fetch-chrome:mac": "node chrome-bundling/fetchChromeForTesting.js mac",
+    "fetch-chrome:mac-arm": "node chrome-bundling/fetchChromeForTesting.js mac_arm",
+    "fetch-chrome:linux": "node chrome-bundling/fetchChromeForTesting.js linux64",
+    "test:db": "node src/server/database/db.js",
+    "test:services": "node -e \"require('./src/server/services/AutoReplyEngine'); require('./src/server/services/BroadcastEngine'); require('./src/server/services/AIMediator'); console.log('All Sprint 4 services OK')\"",
+    "test:persistence": "node --test tests/integration/*.test.js tests/unit/*.test.js"
+  },
+  "dependencies": {
+    "@puppeteer/browsers": "^3.2.1",
+    "archiver": "^5.3.2",
+    "bcryptjs": "^2.4.3",
+    "better-sqlite3": "12.4.1",
+    "emoji-picker-react": "^4.19.1",
+    "exceljs": "^4.4.0",
+    "express": "^4.21.2",
+    "jszip": "^3.10.1",
+    "libphonenumber-js": "^1.13.15",
+    "lucide-react": "^0.475.0",
+    "puppeteer-core": "^25.9.0",
+    "react": "^19.0.0",
+    "react-colorful": "^5.8.0",
+    "react-dom": "^19.0.0",
+    "socket.io": "^4.8.1",
+    "socket.io-client": "^4.8.1",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "@vitejs/plugin-react": "^4.3.4",
+    "electron": "^31.0.0",
+    "electron-builder": "^26.15.3",
+    "javascript-obfuscator": "^5.5.0",
+    "tailwindcss": "^4.3.3",
+    "vite": "^6.1.0"
+  },
+  "allowScripts": {
+    "better-sqlite3@12.4.1": true,
+    "electron@31.0.0": true,
+    "electron-winstaller@5.4.0": true,
+    "esbuild@0.25.12": true
+  }
+}

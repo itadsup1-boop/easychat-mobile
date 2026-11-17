@@ -1,0 +1,3004 @@
+// ── Page Content Script for Business Suite Inbox ──────────────────────────────
+// Injected into https://business.facebook.com/* via manifest.json
+
+// Prevent running in normal www.facebook.com personal chats
+// We only want to run in business.facebook.com OR in an iframe embedded within it.
+const isBusiness = window.location.hostname.includes('business.facebook.com')
+    || window.location.href.includes('asset_id=')
+    || window.location.href.includes('/biz/')
+    || (window.top !== window.self
+        && window.location.hostname.includes('facebook.com')
+        && document.referrer.includes('business.facebook.com'));
+
+if (isBusiness) {
+    console.log(`[PageContent] Business Suite Inbox DOM observer started in ${window.top === window.self ? 'TOP FRAME' : 'IFRAME'}: ${window.location.href}`);
+
+    // 2026-10-09: dừng animation CSS khi tab ẩn — quét DOM nền không cần
+    // animation, tab BS ẩn vẫn đốt CPU render nếu để chạy.
+    (function installHiddenTabAnimationPause() {
+        try {
+            const style = document.createElement('style');
+            style.id = 'crm-pause-hidden-anim';
+            style.textContent = 'html[data-crm-hidden="1"] *, html[data-crm-hidden="1"] *::before,'
+                + ' html[data-crm-hidden="1"] *::after { animation-play-state: paused !important; transition: none !important; }';
+            (document.head || document.documentElement).appendChild(style);
+            const applyHiddenAnimState = () => {
+                if (document.visibilityState === 'hidden') document.documentElement.setAttribute('data-crm-hidden', '1');
+                else document.documentElement.removeAttribute('data-crm-hidden');
+            };
+            document.addEventListener('visibilitychange', applyHiddenAnimState);
+            applyHiddenAnimState();
+        } catch (_) {}
+    })();
+
+    
+    function resolveCurrentPageId() {
+        let pId = new URLSearchParams(window.location.search).get('asset_id')
+            || new URLSearchParams(window.location.search).get('mailbox_id');
+        if (!pId && document.referrer) {
+            try {
+                const refUrl = new URL(document.referrer);
+                pId = refUrl.searchParams.get('asset_id') || refUrl.searchParams.get('mailbox_id');
+            } catch (_) {}
+        }
+        return pId || null;
+    }
+
+    const initialPageContext = resolveCurrentPageId();
+    const initialExtractor = typeof FbPageNameExtractor !== 'undefined' ? FbPageNameExtractor : null;
+    const initialPageName = initialExtractor ? initialExtractor.detectPageName({ document, pageId: initialPageContext, title: document.title }) : null;
+    if (initialPageContext) {
+        chrome.runtime.sendMessage({
+            type: 'PAGE_CONTEXT_READY',
+            data: { page_id: initialPageContext, page_name: initialPageName }
+        }).catch(() => {});
+    }
+
+    // ── Page Name Detection ───────────────────────────────────────────────
+    let lastReportedPageName = initialPageName;
+    let lastReportedPageId = initialPageContext;
+
+    function checkAndReportPageIdentity(force = false) {
+        const pageId = resolveCurrentPageId() || lastReportedPageId;
+        if (!pageId) return;
+
+        const extractor = (typeof FbPageNameExtractor !== 'undefined' ? FbPageNameExtractor : null)
+            || (typeof window !== 'undefined' && window.FbPageNameExtractor ? window.FbPageNameExtractor : null);
+        if (!extractor || typeof extractor.detectPageName !== 'function') return;
+
+        const detectedName = extractor.detectPageName({ document, pageId, title: document.title });
+        if (detectedName && (force || detectedName !== lastReportedPageName || pageId !== lastReportedPageId)) {
+            lastReportedPageName = detectedName;
+            lastReportedPageId = pageId;
+            console.log(`[PageContent] 🏷️ Phát hiện tên Page: "${detectedName}" (ID: ${pageId})`);
+            chrome.runtime.sendMessage({
+                type: 'PAGE_NAME_DETECTED',
+                data: {
+                    page_id: pageId,
+                    page_name: detectedName
+                }
+            }).catch(() => {});
+        }
+    }
+
+    // Quan sát thay đổi document.title (Facebook thường cập nhật title sau khi data nạp xong)
+    try {
+        const titleEl = document.querySelector('title');
+        if (titleEl && typeof MutationObserver === 'function') {
+            const titleObserver = new MutationObserver(() => {
+                checkAndReportPageIdentity(false);
+            });
+            titleObserver.observe(titleEl, { childList: true, subtree: true, characterData: true });
+        }
+    } catch (_) {}
+
+    // Kiểm tra định kỳ (1.5s, 3.5s, 7s) để đón đầu lúc SPA render xong title hoặc switcher
+    setTimeout(() => checkAndReportPageIdentity(false), 1500);
+    setTimeout(() => checkAndReportPageIdentity(false), 3500);
+    setTimeout(() => checkAndReportPageIdentity(false), 7000);
+
+    // ── Watchdog trang trắng ────────────────────────────────────────────────
+    // Tab inbox Business Suite đôi khi chỉ render shell rỗng (màn trắng) — khi
+    // đó không quét/đồng bộ được gì cả. Báo background mở tab mới thay thế
+    // (reproduce 2026-09-18: tab trắng treo spinner vô hạn).
+    let bizInboxRenderedHealthy = false;
+    let blankPageReported = false;
+    // Thread bare id gần nhất xác định được rõ ràng (aria-selected/URL) - dùng
+    // làm fallback cho realtime khi trạng thái DOM tạm thời không đọc được ID.
+    let lastKnownBizThreadId = null;
+
+    function markBizInboxHealthy() { bizInboxRenderedHealthy = true; }
+
+    function bizInboxSpinnerVisible() {
+        try {
+            return !!document.querySelector('svg[aria-label="Loading"], div[role="progressbar"], [aria-busy="true"]');
+        } catch (_) { return false; }
+    }
+
+    function bizInboxLooksBlank(ignoreSpinner) {
+        try {
+            if (window.top !== window.self) return false; // chỉ frame top được báo
+            if (!/\/latest\/inbox/i.test(window.location.pathname)) return false;
+            if (bizInboxRenderedHealthy) return false;
+            if (!ignoreSpinner && bizInboxSpinnerVisible()) return false; // đang loading bình thường
+            const hasInboxUi = !!document.querySelector('[data-surface*="thread_list"], [data-surface*="thread_row"], [data-surface*="detail_column"]');
+            if (hasInboxUi) return false;
+            const textLen = (document.body?.innerText || '').trim().length;
+            return textLen < 120;
+        } catch (_) { return false; }
+    }
+
+    function reportBlankInboxIfStillBlank(ignoreSpinner) {
+        if (blankPageReported || !bizInboxLooksBlank(ignoreSpinner)) return;
+        blankPageReported = true;
+        console.warn(`[PageContent] 🏳️ Tab inbox trắng (không render sau timeout, ignoreSpinner=${!!ignoreSpinner}). Yêu cầu background mở tab mới thay thế.`);
+        chrome.runtime.sendMessage({
+            type: 'PAGE_TAB_BLANK_DETECTED',
+            data: { page_id: initialPageContext, url: window.location.href, ignore_spinner: !!ignoreSpinner }
+        }).catch(() => {});
+    }
+
+    setTimeout(() => reportBlankInboxIfStillBlank(false), 30000);
+    setTimeout(() => reportBlankInboxIfStillBlank(false), 60000);
+    // Mốc cuối: kể cả khi còn spinner (load treo vĩnh viễn cũng tính là trắng)
+    setTimeout(() => reportBlankInboxIfStillBlank(true), 90000);
+
+    class BoundedSet {
+        constructor(maxSize) {
+            this.maxSize = maxSize;
+            this.set = new Set();
+            this.queue = [];
+        }
+        has(val) { return this.set.has(val); }
+        add(val) {
+            if (!this.set.has(val)) {
+                if (this.queue.length >= this.maxSize) {
+                    const oldest = this.queue.shift();
+                    this.set.delete(oldest);
+                }
+                this.set.add(val);
+                this.queue.push(val);
+            }
+        }
+    }
+    let processedHashes = new BoundedSet(1000);
+
+    // Feature 017: a message bubble can be scanned before Facebook attaches its
+    // real data-message-id (a genuine render-timing race for just-arrived
+    // messages). Forwarding it immediately with fb_message_id=null makes the
+    // backend fall back to a content+timestamp fingerprint as its identity;
+    // once the real id attaches a tick later, that's a *different* identity,
+    // so the same logical message lands as two DB rows. Deferring a bounded
+    // number of ticks before forwarding an ID-less bubble gives the real id a
+    // chance to attach first, without ever dropping a message that genuinely
+    // never gets one (see MAX_PENDING_TICKS fallback below).
+    let currentTick = 0;
+    let pendingNoIdBubbles = new WeakMap(); // bubbleEl -> { firstSeenTick }
+    const MAX_PENDING_TICKS = 2;
+
+    // A hash whose direction never resolves (e.g. a non-message UI element
+    // like a Business Suite date separator, which sits outside any real
+    // message bubble and so never gets directional geometry) is never added
+    // to processedHashes below (gated on isOutgoing !== null) - so it would
+    // re-fire as "new" on every 1s scan tick, forever, if it isn't otherwise
+    // filtered. Bound how many ticks an unresolved-direction hash is allowed
+    // to keep re-forwarding before it's remembered anyway. Real messages
+    // resolve their direction (or acquire a real fb_message_id, which keys
+    // off a separate stable hash - see dedupKey below) well within this
+    // window; anything still unresolved past it is presumed not to be a
+    // real message at all.
+    let unresolvedHashFirstSeenTick = new Map(); // hash -> firstSeenTick
+    const MAX_UNRESOLVED_DIRECTION_TICKS = 5;
+    let lastReportedContactName = null;
+    let lastReportedAvatarUrl = null;
+    let lastReportedProfileUrl = null;
+    // Diagnostic bóc field profile (tạm): 1 dump right-rail / thread switch
+    let lastDiagThreadId = null;
+    let lastDiagAt = 0;
+
+    // Verified via live DevTools inspection: Business Suite never exposes a real
+    // per-message clock time (no data-timestamp/title/hover label). What DOM order
+    // does reliably give us is the true chronological order of whatever is
+    // currently mounted (top = oldest, bottom = newest) - that never depends on
+    // Facebook's build-specific class names. We turn that ordering into a
+    // monotonic synthetic timestamp per fb_message_id, anchored against ids we've
+    // already assigned, so relative order stays correct even across virtualization
+    // remounts and scroll-back reveals of older history.
+    const ORDER_GAP_MS = 1000;
+    const MAX_KNOWN_TIMESTAMPS = 3000;
+    // Spec 047: how far behind Date.now() a forward-extrapolated timestamp is
+    // allowed to drift before it's treated as an untrustworthy stale anchor
+    // (see assignOrderedTimestamps below) rather than a real recent time.
+    const STALE_ANCHOR_MS = 5 * 60 * 1000;
+    let knownMessageTimestamps = new Map(); // fbMessageId -> assigned timestamp_ms
+
+    // Fallback only for the rare message with no data-message-id at all (see
+    // isLikelyBacklog below): messages first seen within this long of opening a
+    // thread are backlog, not new arrivals, so they must not be stamped with "now".
+    const THREAD_BACKLOG_WINDOW_MS = 4000;
+    let lastKnownThreadId = null;
+    let lastThreadSwitchAt = Date.now();
+    let currentContactName = null;
+    let currentAvatarUrl = null;
+    let currentProfileUrl = null;
+    let currentAvatarSourceTier = 0; // 0: none, 1: sidebar/header, 2: right details pane
+
+
+    // Active Crawler state (Feature 055)
+    let crawlInProgress = false;
+    const crawlMutex = (typeof FbPageActiveScroller !== 'undefined' && FbPageActiveScroller.createCrawlMutex)
+        ? FbPageActiveScroller.createCrawlMutex()
+        : { acquire: (id) => ({ token: 'mock_' + id, threadId: id }), isTokenValid: () => true, release: () => {}, isBusy: () => false };
+
+    // Use polling to be completely immune to React DOM shuffling
+    setInterval(scanForMessages, 1000);
+    setInterval(scanPageSidebarThreads, 3500);
+    setTimeout(scanPageSidebarThreads, 1500);
+
+    // Tự động kích hoạt Deep Sidebar Scroller sau khi tab đã tải ổn định (~10s)
+    setTimeout(() => {
+        if (!crawlInProgress && !deepSidebarScanInProgress) {
+            scrollPageSidebarDeeply({ maxRounds: 30, stepDistance: 600 }).catch(() => {});
+        }
+    }, 10000);
+
+    // Feature Realtime Sidebar: Lắng nghe biến động Sidebar phát hiện tin nhắn mới tức thì
+    let sidebarDebounceTimer = null;
+    function setupSidebarObserver() {
+        // Chọn container list THẬT: span dòng hội thoại (0x0) cũng chứa
+        // "thread_list" trong data-surface (.../thread_list/thread_row/...),
+        // observer gắn nhầm vào nó sẽ không bao giờ thấy biến động các dòng khác.
+        const sidebarContainer = Array.from(document.querySelectorAll('[data-surface*="thread_list"], [data-surface*="bizweb_inbox:thread_list"]'))
+            .find(el => !/thread_row/.test(el.getAttribute('data-surface') || '') && el.querySelector('[data-surface*="thread_row"], a[href*="selected_item_id="], [role="row"], [role="listitem"]'))
+            || document.querySelector('input[placeholder*="Tìm kiếm" i], input[placeholder*="Search" i]')?.closest('[role="navigation"], div')
+            || document.body;
+        if (!sidebarContainer) {
+            setTimeout(setupSidebarObserver, 2000);
+            return;
+        }
+        try {
+            const observer = new MutationObserver(() => {
+                if (sidebarDebounceTimer) clearTimeout(sidebarDebounceTimer);
+                sidebarDebounceTimer = setTimeout(() => {
+                    scanPageSidebarThreads();
+                }, 300);
+            });
+            observer.observe(sidebarContainer, { childList: true, subtree: true });
+            console.log('[PageContent] ⚡ Đã kích hoạt MutationObserver theo dõi Sidebar real-time (< 1s)');
+        } catch (e) {
+            console.warn('[PageContent] Không thể gắn observer cho sidebar:', e.message);
+        }
+    }
+    setTimeout(setupSidebarObserver, 2000);
+
+    // Feature 055: Old passive scrollBackForHistory interval is deprecated and replaced
+    // by the active on-demand crawler triggered by REQUEST_PAGE_BATCH_SYNC.
+    // setInterval(scrollBackForHistory, SCROLL_INTERVAL_MS);
+
+    let isScanning = false;
+
+    function resolveCurrentThreadId() {
+        // DOM First: Find currently selected item in Business Suite sidebar
+        const selectedContainer = document.querySelector('[role="navigation"] [aria-selected="true"], [role="gridcell"] [aria-selected="true"], [data-surface*="thread_list"] [aria-selected="true"], [aria-selected="true"], [aria-current="page"], [aria-current="true"]');
+        if (selectedContainer) {
+            const links = selectedContainer.tagName === 'A' ? [selectedContainer] : Array.from(selectedContainer.querySelectorAll('a[href]'));
+            for (const link of links) {
+                const linkHref = link.getAttribute('href') || link.href || '';
+                const m = linkHref.match(/(?:selected_item_id|thread_id)=(\d+)/) || linkHref.match(/\/messages\/(?:e2ee\/)?t\/(\d+)/);
+                if (m && m[1]) return m[1];
+            }
+        }
+
+        const href = window.location.href;
+        const urlMatch = href.match(/[?&](?:selected_item_id|thread_id)=(\d+)/) || href.match(/\/messages\/(?:e2ee\/)?t\/(\d+)/);
+        if (urlMatch && urlMatch[1]) {
+            return urlMatch[1];
+        }
+
+        // Không còn fallback "link đầu tiên trong DOM": khi không có dấu hiệu
+        // rõ ràng (aria-selected / URL) thì trả null thay vì đoán - attribution
+        // sai thread làm tin nhắn của khách này dán nhầm cho khách khác
+        // (reproduce 2026-09-19: lướt lên Phạm Hùng nhưng tab đang mở
+        // Lê Kim Thanh Ngân, batch bị gán nhầm thread).
+        return null;
+    }
+
+    function bareThreadIdOf(id) {
+        const str = String(id || '');
+        return str.includes(':') ? str.split(':').pop() : str;
+    }
+
+    function looseNameMatch(a, b) {
+        const norm = (s) => String(s || '').toLowerCase().normalize('NFD')
+            .replace(/[\u0300-\u036f]/g, '')
+            .replace(/đ/g, 'd')
+            .replace(/[^a-z0-9]/g, '');
+        const na = norm(a);
+        const nb = norm(b);
+        if (!na || !nb) return false;
+        return na === nb || na.includes(nb) || nb.includes(na);
+    }
+
+    // Tên hội thoại đang hiển thị trên header khung chat (cột detail).
+    function getVisibleBizChatHeaderName() {
+        try {
+            const candidates = Array.from(document.querySelectorAll('[data-surface*="detail_column"]')).sort((a, b) => {
+                const ra = a.getBoundingClientRect();
+                const rb = b.getBoundingClientRect();
+                return (Math.round(ra.top) - Math.round(rb.top)) || (Math.round(ra.left) - Math.round(rb.left));
+            });
+            for (const el of candidates) {
+                if (el.closest('[role="complementary"], aside')) continue;
+                const txt = (el.textContent || '').trim().split('\n')[0].trim();
+                if (txt && txt.length >= 2 && txt.length <= 80 && !/^\d+$/.test(txt)) return txt;
+            }
+        } catch (_) {}
+        return null;
+    }
+
+    // Bộ đệm thông tin hội thoại nhận từ MAIN world (injected.js)
+    const cachedBizThreadsFromMain = new Map();
+
+    // Lắng nghe URL video đã giải mã từ MAIN world (injected.js)
+    const reportedResolvedMedia = new Set();
+    // Dedup tin nhắn relay từ websocket BS (injected.js -> page_content)
+    const relayedNetworkMids = new Set();
+    window.addEventListener('message', (event) => {
+        if (event.data?.type === 'CRM_RESOLVE_PAGE_VIDEO_RESPONSE') {
+            const { fb_message_id, videoUrl, posterUrl } = event.data || {};
+            if (!fb_message_id || (!videoUrl && !posterUrl)) return;
+
+            const effectiveUrl = videoUrl || posterUrl;
+            const dedupeKey = `${fb_message_id}:${effectiveUrl}`;
+            if (reportedResolvedMedia.has(dedupeKey)) return;
+            reportedResolvedMedia.add(dedupeKey);
+            if (reportedResolvedMedia.size > 2000) {
+                const first = reportedResolvedMedia.values().next().value;
+                reportedResolvedMedia.delete(first);
+            }
+
+            const escaped = typeof CSS !== 'undefined' && CSS.escape ? CSS.escape(fb_message_id) : fb_message_id;
+            const msgNode = document.querySelector(`[data-message-id="${escaped}"]`) ||
+                document.querySelector(`[data-id="${escaped}"]`);
+            if (msgNode) {
+                if (videoUrl) msgNode.setAttribute('data-crm-video-url', videoUrl);
+                if (posterUrl) msgNode.setAttribute('data-crm-poster-url', posterUrl);
+            }
+
+            const currentThread = resolveCurrentThreadId();
+            if (currentThread && effectiveUrl) {
+                console.log(`[PageContent] 🎬 Nhận được URL video cho ${fb_message_id} -> Gửi lên Server:`, effectiveUrl.substring(0, 60));
+                chrome.runtime.sendMessage({
+                    type: 'PAGE_MESSAGE_MEDIA_RESOLVED',
+                    data: {
+                        thread_id: currentThread,
+                        fb_message_id: fb_message_id,
+                        media_type: 'video',
+                        video_url: effectiveUrl,
+                        media_url: effectiveUrl,
+                        poster_url: posterUrl || null
+                    }
+                }).catch(() => {});
+            }
+        }
+
+        if (event.data?.type === 'CRM_EXTRACT_BIZ_SIDEBAR_RESPONSE') {
+            const threads = event.data?.threads || [];
+            for (const t of threads) {
+                if (t && t.threadId) {
+                    cachedBizThreadsFromMain.set(String(t.threadId), t);
+                }
+            }
+        }
+
+        // Tin nhắn realtime bắt từ websocket/mạng của Business Suite (injected.js
+        // MAIN world). Bắt được cả khi khung chat đang mở thread KHÁC hoặc ngồi
+        // ở inbox list - không cần điều hướng tab, đồng bộ nhanh hơn hẳn.
+        if (event.data?.type === 'FB_NETWORK_MESSAGE') {
+            const netMsg = event.data?.data || {};
+            if (!netMsg || !netMsg.thread_id || !netMsg.fb_message_id) return;
+            if (!netMsg.content && !netMsg.media_url) return;
+            if (typeof location === 'undefined' || location.hostname !== 'business.facebook.com') return;
+
+            const dedupeKey = String(netMsg.thread_id) + '_' + String(netMsg.fb_message_id);
+            if (relayedNetworkMids.has(dedupeKey)) return;
+            relayedNetworkMids.add(dedupeKey);
+            if (relayedNetworkMids.size > 3000) {
+                const first = relayedNetworkMids.values().next().value;
+                relayedNetworkMids.delete(first);
+            }
+
+            const pageId = resolveCurrentPageId();
+            const cUser = document.cookie.match(/c_user=(\d+)/)?.[1] || null;
+            const senderId = netMsg.sender_id ? String(netMsg.sender_id) : null;
+            let isOutgoing = null;
+            if (senderId) {
+                if ((pageId && String(senderId) === String(pageId)) || (cUser && String(senderId) === String(cUser))) {
+                    isOutgoing = true;
+                } else {
+                    isOutgoing = false;
+                }
+            }
+
+            const ts = Number(netMsg.timestamp_ms);
+            chrome.runtime.sendMessage({
+                type: 'NEW_PAGE_MESSAGE_FROM_DOM',
+                data: {
+                    thread_id: String(netMsg.thread_id),
+                    fb_message_id: netMsg.fb_message_id,
+                    content: String(netMsg.content || ''),
+                    is_outgoing: isOutgoing,
+                    direction_status: isOutgoing === null ? 'pending' : 'confirmed',
+                    direction_source: 'bs_network_ws',
+                    direction_confidence: isOutgoing === null ? 'unknown' : 'high',
+                    page_id: pageId || null,
+                    page_name: lastReportedPageName || null,
+                    sender_id: senderId,
+                    source: 'page_network_interceptor',
+                    timestamp_ms: ts > 0 ? ts : Date.now(),
+                    timestamp_source: ts > 0 ? 'facebook_payload' : 'realtime_fallback',
+                    media_type: netMsg.media_type || 'text',
+                    media_url: netMsg.media_url || null
+                }
+            }).catch(() => {});
+        }
+    });
+
+    window.addEventListener('popstate', () => setTimeout(scanForMessages, 300));
+    window.addEventListener('hashchange', () => setTimeout(scanForMessages, 300));
+    document.addEventListener('click', (e) => {
+        if (e.target?.closest?.('[role="listitem"], [role="row"], a[href]')) {
+            setTimeout(scanForMessages, 500);
+        }
+    }, true);
+
+    // Lắng nghe hover tooltip để bóc tách giờ thật chi tiết từ Facebook Page
+    let hoverTooltipTimer = null;
+    document.addEventListener('mouseover', (e) => {
+        const msgEl = e.target?.closest?.('[data-message-id]');
+        if (!msgEl) return;
+        const fbMessageId = msgEl.getAttribute('data-message-id');
+        if (!fbMessageId) return;
+
+        clearTimeout(hoverTooltipTimer);
+        hoverTooltipTimer = setTimeout(() => {
+            const describedBy = msgEl.getAttribute('aria-describedby');
+            let tooltipEl = describedBy ? document.getElementById(describedBy) : null;
+            if (!tooltipEl) {
+                const tooltips = document.querySelectorAll('[role="tooltip"], [data-testid*="tooltip"]');
+                if (tooltips.length > 0) tooltipEl = tooltips[tooltips.length - 1];
+            }
+            if (tooltipEl) {
+                const tooltipText = (tooltipEl.textContent || '').trim();
+                const parser = (typeof FbPageTimestampParser !== 'undefined' ? FbPageTimestampParser.parseTimeFromLabel : null)
+                    || (typeof window !== 'undefined' && window.FbPageTimestampParser ? window.FbPageTimestampParser.parseTimeFromLabel : null);
+                if (typeof parser === 'function') {
+                    const preciseTs = parser(tooltipText);
+                    if (preciseTs && preciseTs > 0) {
+                        knownMessageTimestamps.set(fbMessageId, preciseTs);
+                        const threadId = resolveCurrentThreadId();
+                        if (threadId) {
+                            chrome.runtime.sendMessage({
+                                type: 'UPGRADE_MESSAGE_TIMESTAMP',
+                                data: {
+                                    thread_id: threadId,
+                                    fb_message_id: fbMessageId,
+                                    timestamp_ms: preciseTs,
+                                    timestamp_source: 'facebook_label'
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+        }, 350);
+    }, { passive: true });
+
+    function isLikelyBacklog(threadId) {
+        if (threadId !== lastKnownThreadId) {
+            lastKnownThreadId = threadId;
+            lastThreadSwitchAt = Date.now();
+            currentContactName = null;
+            currentAvatarUrl = null;
+            currentProfileUrl = null;
+            currentAvatarSourceTier = 0;
+            return true; // just switched/opened this thread; whatever is already mounted is backlog
+        }
+        return (Date.now() - lastThreadSwitchAt) < THREAD_BACKLOG_WINDOW_MS;
+    }
+
+    // Re-seeds knownMessageTimestamps from the backend's persisted record for
+    // this thread when we start observing it. Without this, a content-script
+    // restart (tab reload, browser restart, service worker restart) wipes
+    // knownMessageTimestamps, and any message that's genuinely new to the
+    // backend but discovered with zero surviving anchors falls back to "now" -
+    // stamping a message from days ago as if it arrived today. Fire-and-forget:
+    // never awaited, never blocks the 1s scan cadence, degrades to today's
+    // existing in-memory-only behavior if the backend is unreachable.
+    function seedTimestampAnchorsForThread(threadId) {
+        if (!threadId) return;
+        chrome.runtime.sendMessage({ type: 'GET_THREAD_TIMESTAMPS', data: { threadId } }, (response) => {
+            if (chrome.runtime.lastError) return; // background unreachable - degrade silently
+            const timestamps = response && response.timestamps;
+            if (!Array.isArray(timestamps)) return;
+            for (const entry of timestamps) {
+                const id = entry && entry.fb_message_id;
+                const ts = entry && entry.timestamp_ms;
+                // Never overwrite an anchor this session already set more precisely.
+                if (id && typeof ts === 'number' && !knownMessageTimestamps.has(id)) {
+                    knownMessageTimestamps.set(id, ts);
+                }
+            }
+        });
+    }
+
+    function findScrollableMessageContainer() {
+        const scrollerHelper = typeof FbPageActiveScroller !== 'undefined' ? FbPageActiveScroller : null;
+        if (scrollerHelper && typeof scrollerHelper.findPageHistoryScroller === 'function') {
+            const scoredScroller = scrollerHelper.findPageHistoryScroller(document.body);
+            if (scoredScroller) return scoredScroller;
+        }
+
+        const anyMessage = document.querySelector('[data-message-id]');
+        if (!anyMessage) return null;
+        let curr = anyMessage.parentElement;
+        let overflowCapableFallback = null;
+
+        while (curr && curr !== document.body) {
+            const style = window.getComputedStyle(curr);
+            const isOverflowCapable = style.overflowY === 'auto' || style.overflowY === 'scroll' || style.overflowY === 'overlay';
+            if (isOverflowCapable) {
+                if (scrollerHelper && typeof scrollerHelper.isMessageLogContainer === 'function') {
+                    if (scrollerHelper.isMessageLogContainer(curr)) {
+                        return curr;
+                    }
+                } else {
+                    const isNav = curr.closest && curr.closest('[role="navigation"], [data-surface*="thread_list"], .sidebar');
+                    if (!isNav && curr.scrollHeight > curr.clientHeight + 10) {
+                        return curr;
+                    }
+                }
+                if (!overflowCapableFallback) overflowCapableFallback = curr;
+            }
+            curr = curr.parentElement;
+        }
+        return overflowCapableFallback;
+    }
+
+    // Same role="region"/main/grid detection strategy already used by the
+    // inChatContainer walk in processPotentialMessage, but returning the actual
+    // container element instead of a boolean, so other lookups (contact name /
+    function isExcludedElement(el) {
+        if (!el) return false;
+        const target = el.nodeType === 1 ? el : el.parentElement;
+        if (!target) return false;
+        if (target.closest('nav, [role="navigation"], [data-surface*="nav"], header, [role="banner"], aside, [aria-label*="Điều hướng"], [aria-label*="Navigation"], [data-surface*="thread_list"], [role="gridcell"], form, [role="textbox"], [contenteditable="true"]')) {
+            return true;
+        }
+        try {
+            const rect = target.getBoundingClientRect();
+            if (rect.width > 0 && rect.right < 200) {
+                return true;
+            }
+        } catch (e) {}
+        return false;
+    }
+
+    // Trích xuất Avatar đa định dạng: hỗ trợ img, SVG image và CSS background-image
+    function extractAvatarFromElement(container) {
+        if (!container) return null;
+        try {
+            // 1. Regular <img>
+            const img = container.querySelector('img[src*="fbcdn.net"], img[src*="scontent"], img.img');
+            if (img) {
+                const src = img.getAttribute('src');
+                if (src && src.startsWith('http') && !src.includes('rsrc.php') && !src.includes('static.xx.fbcdn')) {
+                    if (!((img.naturalWidth && img.naturalWidth <= 24) || (img.width > 0 && img.width <= 24))) {
+                        return src;
+                    }
+                }
+            }
+            // 2. SVG <image>
+            const svgImages = container.querySelectorAll('svg image');
+            for (const svgImg of svgImages) {
+                const href = svgImg.getAttribute('xlink:href') || svgImg.getAttribute('href');
+                if (href && href.startsWith('http') && !href.includes('rsrc.php') && !href.includes('static.xx.fbcdn')) {
+                    return href;
+                }
+            }
+            // 3. CSS background-image
+            const bgEls = container.querySelectorAll('[style*="background-image"]');
+            for (const bg of bgEls) {
+                const style = bg.getAttribute('style') || '';
+                const m = style.match(/background-image\s*:\s*url\((['"]?)(https?:\/\/[^'")]+)\1\)/i);
+                if (m && m[2] && !m[2].includes('rsrc.php') && !m[2].includes('static.xx.fbcdn')) {
+                    return m[2];
+                }
+            }
+        } catch (_) {}
+        return null;
+    }
+
+    // Trích xuất Profile URL: ưu tiên module FbPageProfileUrlExtractor.
+    // KHÔNG phịa profile.php?id=<threadId> khi không tìm thấy link trong DOM -
+    // thread id Page (selected_item_id/PSID) không phải UID toàn cục của khách,
+    // phịa ra là link chết trang trắng (reproduce 2026-10-19).
+    function extractProfileUrlFromElement(container) {
+        const extractor = globalThis.FbPageProfileUrlExtractor || (typeof window !== 'undefined' && window.FbPageProfileUrlExtractor);
+        if (extractor && typeof extractor.extractProfileUrlFromElement === 'function') {
+            return extractor.extractProfileUrlFromElement(container);
+        }
+        if (container) {
+            try {
+                const links = Array.from(container.querySelectorAll('a[href*="facebook.com"], a[href^="/"]'));
+                for (const a of links) {
+                    const href = a.getAttribute('href') || a.href || '';
+                    if (!href || href.includes('business.facebook.com') || href.includes('/help/') || href.includes('/policies/')) continue;
+                    const m = href.match(/(?:profile\.php\?id=|facebook\.com\/)(\d{10,18})/i);
+                    if (m) return `https://www.facebook.com/profile.php?id=${m[1]}`;
+                }
+            } catch (_) {}
+        }
+        return null;
+    }
+
+    // Business Suite (bản 2026+): mỗi dòng hội thoại trong danh sách là một
+    // <span data-surface=".../thread_list/thread_row/..."> inline KHÔNG có hộp
+    // hiển thị (getBoundingClientRect() = 0x0), nên mọi bộ lọc theo rect đều
+    // loại nhầm. Dòng "thật" là ancestor gần nhất có kích thước hợp lệ (~366x38).
+    function findVisibleBizRowContainer(el) {
+        let node = el;
+        while (node && node !== document.body) {
+            try {
+                const rect = node.getBoundingClientRect();
+                if (rect.width >= 150 && rect.height >= 30 && rect.height <= 180) return node;
+            } catch (_) {}
+            node = node.parentElement;
+        }
+        return null;
+    }
+
+    // ID hội thoại nằm trong React props với tên CHÍNH XÁC "threadID" (D hoa) -
+    // bản cũ tìm "threadId" nên không bao giờ khớp, rồi rơi xuống prop generic
+    // (id/userId) và bắt nhầm ID khác khiến mọi dòng bị gộp thành 1 thread.
+    // Chỉ đi NGANG lên chuỗi fiber.return (đã kiểm chứng qua console), không
+    // duyệt child/sibling để tránh nhảy sang subtree của dòng khác.
+    const BIZ_THREAD_ID_PROPS = ['threadID', 'threadId', 'thread_id', 'threadKey', 'thread_key', 'threadFbid', 'thread_fbid', 'conversationID', 'conversation_id', 'otherUserFbId', 'other_user_id', 'recipientId'];
+
+    function extractPageThreadIdFromFiber(rootEl, excludeId) {
+        if (!rootEl) return null;
+
+        // 1. Kiểm tra thuộc tính data-crm-thread-id do injected.js (MAIN world) đã bóc tách từ Fiber và đóng dấu lên DOM
+        const stampedId = rootEl.getAttribute?.('data-crm-thread-id') ||
+            rootEl.querySelector?.('[data-crm-thread-id]')?.getAttribute?.('data-crm-thread-id') ||
+            rootEl.closest?.('[data-crm-thread-id]')?.getAttribute?.('data-crm-thread-id');
+        if (stampedId && stampedId !== excludeId) return stampedId;
+
+        // 2. Thử trực tiếp nếu chạy cùng world (fallback)
+        const candidates = [rootEl, ...Array.from(rootEl.querySelectorAll('*')).slice(0, 8)];
+        for (const el of candidates) {
+            let reactKey = null;
+            try {
+                reactKey = Object.keys(el).find(k => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'));
+            } catch (_) {}
+            if (!reactKey) continue;
+            let curr = el[reactKey];
+            let depth = 0;
+            while (curr && depth < 30) {
+                depth++;
+                const props = curr.memoizedProps || curr.props;
+                if (props) {
+                    for (const p of BIZ_THREAD_ID_PROPS) {
+                        const m = String(props[p] || '').match(/(\d{10,})/);
+                        if (m && m[1] !== excludeId) return m[1];
+                    }
+                }
+                curr = curr.return;
+            }
+        }
+        return null;
+    }
+
+    // Same role="region"/main/grid detection strategy already used by the
+    // inChatContainer walk in processPotentialMessage, but returning the actual
+    // container element instead of a boolean, so other lookups (contact name /
+    // avatar) can be scoped to it instead of querying the whole document - the
+    // Business Suite sidebar conversation list has its own avatar thumbnails
+    // that must never leak into the currently-open thread's contact info.
+    function findMessageListContainer() {
+        const anchor = document.querySelector('[data-message-id]')
+            || document.querySelector('[aria-label*="Đoạn chat"]')
+            || document.querySelector('[aria-label*="tin nhắn"]');
+        if (!anchor) return null;
+        let curr = anchor.parentElement || anchor;
+        while (curr && curr !== document.body) {
+            if (curr.getAttribute) {
+                const label = (curr.getAttribute('aria-label') || '').toLowerCase();
+                const role = curr.getAttribute('role');
+                if (role === 'region' && (label.includes('tin nhắn') || label.includes('message') || label.includes('msg') || label.includes('chat'))) {
+                    return curr;
+                }
+                if (role === 'grid' && !label.includes('hội thoại') && !label.includes('cuộc trò chuyện') && !label.includes('thread')) {
+                    return curr;
+                }
+                if (role === 'main' && !label.includes('bảng feed') && !label.includes('sidebar')) {
+                    return curr;
+                }
+            }
+            curr = curr.parentElement;
+        }
+        return anchor.parentElement || null;
+    }
+
+    // Direction is measured relative to the actual message-list container.
+    // A missing/ambiguous layout is deliberately returned as unknown; callers
+    // persist it as pending instead of silently treating it as incoming.
+    function getDirectionEvidence(messageEl, messageListContainer) {
+        const classifier = globalThis.FbCrmPageDirection
+            && globalThis.FbCrmPageDirection.classifyByContainerEdges;
+        if (!classifier || !messageEl || !messageListContainer) {
+            return { direction: null, source: 'unknown', confidence: 'unknown' };
+        }
+        try {
+            // 1. Kiểm tra aria-label trợ năng trên messageEl hoặc row cha
+            const messageRow = messageEl.closest?.('[role="row"], [role="article"], [data-surface*="message"]') || messageEl.parentElement;
+            const elAria = (messageEl.getAttribute?.('aria-label') || '').toLowerCase();
+            const rowAria = (messageRow?.getAttribute?.('aria-label') || '').toLowerCase();
+            const combinedAria = elAria + ' ' + rowAria;
+
+            if (combinedAria.includes('tin nhắn do bạn gửi') || combinedAria.includes('message from you') || combinedAria.includes('you sent')) {
+                return { direction: true, source: 'aria_label', confidence: 'high' };
+            }
+
+            const sentByMatch = combinedAria.match(/tin nhắn do ([^]+?) gửi lúc/i) || combinedAria.match(/message sent by ([^]+?) at/i);
+            if (sentByMatch) {
+                const rawSender = sentByMatch[1].trim().toLowerCase();
+                if (rawSender === 'bạn' || rawSender === 'you') {
+                    return { direction: true, source: 'aria_label', confidence: 'high' };
+                } else {
+                    return { direction: false, source: 'aria_label', confidence: 'high' };
+                }
+            }
+
+            // 2. Tìm visual element thực sự bên trong (tránh lấy bounding box của thẻ cha width 100%)
+            let targetMeasureEl = messageEl;
+            if (messageEl.tagName && (messageEl.tagName.toLowerCase() === 'svg' || messageEl.tagName.toLowerCase() === 'img' || messageEl.getAttribute?.('role') === 'img')) {
+                targetMeasureEl = messageEl;
+            } else if (isLikeElementOrWrapper(messageEl)) {
+                const likeVisual = messageEl.querySelector?.('svg:not([aria-label*="tùy chọn" i]):not([aria-label*="bày tỏ" i]):not([aria-label*="khác" i]), [role="img"]:not([aria-label*="đại diện" i]), img:not([alt*="đại diện" i])');
+                if (likeVisual) targetMeasureEl = likeVisual;
+            } else {
+                const innerVisual = messageEl.querySelector?.('video, [data-surface*="video"], [dir="auto"], svg:not([aria-label*="tùy chọn" i]):not([aria-label*="bày tỏ" i]):not([aria-label*="khác" i]), img:not([alt*="đại diện" i]):not([alt*="profile" i]), [role="img"]:not([aria-label*="đại diện" i])');
+                if (innerVisual) {
+                    const vRect = innerVisual.getBoundingClientRect();
+                    if (vRect.width > 0 && vRect.height > 0) {
+                        targetMeasureEl = innerVisual;
+                    }
+                }
+            }
+
+            // 3. Kiểm tra avatar của khách hàng đi kèm trong cụm tin nhắn
+            let hasContactAvatar = null;
+            if (messageRow) {
+                hasContactAvatar = messageRow.querySelector?.('img[alt*="đại diện" i], img[alt*="profile" i], [aria-label*="ảnh đại diện" i], [aria-label*="profile picture" i]');
+                if (!hasContactAvatar && currentContactName && typeof currentContactName === 'string') {
+                    const cleanName = currentContactName.trim();
+                    if (cleanName.length >= 2) {
+                        const allImgs = Array.from(messageRow.querySelectorAll?.('img[alt], [role="img"][aria-label], img[aria-label]') || []);
+                        for (const img of allImgs) {
+                            const alt = (img.getAttribute('alt') || img.getAttribute('aria-label') || '').toLowerCase();
+                            if (alt.includes(cleanName.toLowerCase())) {
+                                hasContactAvatar = img;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Nếu phát hiện có avatar của khách hàng trong cụm tin nhắn -> 100% là tin khách gửi (incoming)
+            if (hasContactAvatar) {
+                return { direction: false, source: 'avatar_contact_match', confidence: 'high' };
+            }
+
+            // 3.5. Kiểm tra đặc trưng Màu sắc cho nút Like (Vàng/Cam = Page, Xanh = Khách)
+            if (isLikeElementOrWrapper(messageEl)) {
+                const checkElements = [messageEl, targetMeasureEl, messageEl.parentElement, ...(messageEl.querySelectorAll ? Array.from(messageEl.querySelectorAll('svg, path, [role="img"], img')) : [])];
+                for (const node of checkElements) {
+                    if (!node) continue;
+                    const fill = (node.getAttribute?.('fill') || (node.style && node.style.fill) || '').toLowerCase();
+                    const stroke = (node.getAttribute?.('stroke') || (node.style && node.style.stroke) || '').toLowerCase();
+                    const style = (node.getAttribute?.('style') || '').toLowerCase();
+                    const color = (node.style && node.style.color ? node.style.color : '').toLowerCase();
+                    const combined = fill + ' ' + stroke + ' ' + style + ' ' + color;
+
+                    // Màu vàng/cam/amber -> Nút Like của Page (Outgoing)
+                    if (/f7b125|fa3e3e|fa7b25|rgb\(\s*247|rgb\(\s*250|rgb\(\s*255,\s*(?:1|2)|yellow|gold|amber|orange/i.test(combined)) {
+                        return { direction: true, source: 'like_color_page', confidence: 'high' };
+                    }
+                    // Màu xanh dương -> Nút Like của Khách (Incoming)
+                    if (/0084ff|0080ff|0a7cff|rgb\(\s*0,\s*132|rgb\(\s*0,\s*128|blue/i.test(combined)) {
+                        return { direction: false, source: 'like_color_customer', confidence: 'high' };
+                    }
+                }
+
+                // 3.6. Kiểm tra cấu trúc row cha / wrapper của Nút Like
+                const rowOrParent = messageEl.closest?.('[role="row"], [role="article"], [data-surface*="message"]') || messageEl.parentElement;
+                if (rowOrParent) {
+                    const avatarInRow = rowOrParent.querySelector?.('img[alt*="đại diện" i], img[alt*="profile" i], [aria-label*="ảnh đại diện" i]');
+                    if (avatarInRow) {
+                        return { direction: false, source: 'like_avatar_match', confidence: 'high' };
+                    }
+                    try {
+                        const rowStyle = window.getComputedStyle(rowOrParent);
+                        if (rowStyle.justifyContent === 'flex-end' || rowStyle.alignItems === 'flex-end') {
+                            return { direction: true, source: 'like_row_end', confidence: 'high' };
+                        }
+                        if (rowStyle.justifyContent === 'flex-start' || rowStyle.alignItems === 'flex-start') {
+                            return { direction: false, source: 'like_row_start', confidence: 'high' };
+                        }
+                    } catch (_) {}
+                }
+            }
+
+            // 4. Đo mép container kết hợp đường phân chia trung tâm (Center-line)
+            const cRect = messageListContainer.getBoundingClientRect();
+            const bRect = targetMeasureEl.getBoundingClientRect();
+            const measureEl = (bRect.width > 0 && bRect.height > 0) ? targetMeasureEl : (messageEl.parentElement || targetMeasureEl);
+            const effectiveBRect = measureEl.getBoundingClientRect();
+
+            if (cRect.width > 0 && effectiveBRect.width > 0) {
+                const containerCenter = cRect.left + cRect.width * 0.52;
+                const bubbleCenter = effectiveBRect.left + effectiveBRect.width / 2;
+                if (bubbleCenter < containerCenter - 15) {
+                    return { direction: false, source: 'container_centerline', confidence: 'high' };
+                }
+                if (bubbleCenter > containerCenter + 15) {
+                    return { direction: true, source: 'container_centerline', confidence: 'high' };
+                }
+            }
+
+            const geom = classifier({
+                containerRect: cRect,
+                bubbleRect: bRect,
+                tolerancePx: 12
+            });
+
+            return geom;
+        } catch (error) {
+            console.warn('[PageContent] Direction geometry unavailable:', error.message);
+            return { direction: null, source: 'unknown', confidence: 'unknown' };
+        }
+    }
+
+    // Assigns every currently-mounted message a monotonic synthetic timestamp
+    // consistent with its DOM position, using previously-assigned values as fixed
+    // anchors so already-sent messages never change order. New ids slot in via
+    // interpolation between their nearest known neighbors (or extrapolate past the
+    // oldest/newest known anchor for scroll-back history / brand new arrivals).
+    function assignOrderedTimestamps(orderedIds) {
+        // Trả về Map id -> timestamp. CHỈ giá trị suy ra từ anchor THẬT (đã có
+        // trong knownMessageTimestamps) mới được ghi lại vào map. Giá trị
+        // zero-anchor (Date.now() khi chưa có anchor nào - phiên mới/tabe mới)
+        // được đánh dấu synthetic: KHÔNG ghi map, để lần quét sau khi separator
+        // Business Suite render xong sẽ gán giờ thật (separator rank 4 > dom_order
+        // rank 2, server cho phép upgrade) — trước đây zero-anchor ghi vĩnh viễn
+        // giờ-cào vào map khiến cả lịch sử bị "Hôm Nay" (reproduce 2026-09-28).
+        const assigned = new Map();
+        const syntheticIds = new Set();
+        let lastIdx = -1;
+        let lastTs = null;
+        let lastReal = false;
+
+        for (let i = 0; i < orderedIds.length; i++) {
+            const id = orderedIds[i];
+            if (!id) continue;
+            if (knownMessageTimestamps.has(id)) {
+                lastIdx = i;
+                lastTs = knownMessageTimestamps.get(id);
+                lastReal = true;
+                assigned.set(id, lastTs);
+                continue;
+            }
+
+            let nextIdx = -1;
+            let nextTs = null;
+            for (let j = i + 1; j < orderedIds.length; j++) {
+                if (orderedIds[j] && knownMessageTimestamps.has(orderedIds[j])) {
+                    nextIdx = j;
+                    nextTs = knownMessageTimestamps.get(orderedIds[j]);
+                    break;
+                }
+            }
+
+            let val;
+            let isSynthetic;
+            if (lastTs !== null && nextTs !== null && nextTs > lastTs) {
+                const span = nextIdx - lastIdx;
+                const pos = i - lastIdx;
+                val = Math.round(lastTs + (nextTs - lastTs) * (pos / span));
+                if (val <= lastTs) val = lastTs + 1;
+                if (val >= nextTs) val = nextTs - 1;
+                isSynthetic = !lastReal; // kế thừa tính synthetic của mốc trước
+            } else if (lastTs !== null) {
+                val = lastTs + ORDER_GAP_MS * (i - lastIdx);
+                isSynthetic = !lastReal;
+            } else if (nextTs !== null) {
+                val = nextTs - ORDER_GAP_MS * (nextIdx - i);
+                isSynthetic = false; // nội suy ngược từ anchor thật
+            } else {
+                // No anchors anywhere in the currently-mounted list yet (fresh session).
+                val = Date.now() - ORDER_GAP_MS * (orderedIds.length - i);
+                isSynthetic = true;
+            }
+
+            assigned.set(id, val);
+            if (!isSynthetic) knownMessageTimestamps.set(id, val);
+            // Vẫn dùng giá trị synthetic làm mốc nội bộ cho phần còn lại của pass
+            // (giữ thứ tự đơn điệu), nhưng không ghi vào map.
+            lastIdx = i;
+            lastTs = val;
+            lastReal = !isSynthetic;
+        }
+
+        if (knownMessageTimestamps.size > MAX_KNOWN_TIMESTAMPS) knownMessageTimestamps.clear();
+        return assigned;
+    }
+
+    let threadSM = null;
+    let lastSyncedOldestMessageId = null;
+    let lastSyncedMountedSignature = '';
+    // Chống spam batch passive: tối thiểu 3s giữa 2 lần emit PAGE_THREAD_MESSAGES_SYNCED_V1
+    let lastPassiveEmitAt = 0;
+
+    function getOrInitStateMachine(threadId) {
+        if (!threadId) return null;
+        if (!threadSM || threadSM.threadId !== threadId) {
+            const SMClass = (typeof ThreadScanStateMachine !== 'undefined' ? ThreadScanStateMachine : null)
+                || (typeof window !== 'undefined' ? window.ThreadScanStateMachine : null);
+            if (SMClass) {
+                threadSM = new SMClass(threadId);
+                lastSyncedOldestMessageId = null;
+                lastSyncedMountedSignature = '';
+            }
+        }
+        return threadSM;
+    }
+
+    function findDateSeparatorsInContainer(container) {
+        if (!container) return [];
+        const sepParser = (typeof FbPageTimestampParser !== 'undefined' ? FbPageTimestampParser.parseDateSeparator : null)
+            || (typeof window !== 'undefined' && window.FbPageTimestampParser ? window.FbPageTimestampParser.parseDateSeparator : null);
+        if (typeof sepParser !== 'function') return [];
+
+        const candidates = container.querySelectorAll('div, span, p');
+        const separators = [];
+
+        for (let i = 0; i < candidates.length; i++) {
+            const el = candidates[i];
+            if (el.matches('[data-message-id]') || el.querySelector('[data-message-id]')) continue;
+            if (el.children.length > 2) continue;
+            // LƯU Ý: KHÔNG được đưa [role="region"] vào chuỗi closest() - container
+            // hội thoại của Business Suite chính là role="region", nên mọi phần tử
+            // trong container đều khớp closest() và bị loại toàn bộ -> mảng
+            // separator luôn rỗng -> toàn bộ tin bị dán giờ-cào (reproduce
+            // 2026-09-28: cả lịch sử page mới nằm dưới "Hôm Nay"). Chỉ loại
+            // video/player region cụ thể.
+            if (el.closest && el.closest('video, [aria-label*="video" i], [aria-label*="player" i], [data-surface*="video"]')) continue;
+
+            const text = (el.textContent || '').trim();
+            if (!text || text.length > 50) continue;
+            if (/^\d{1,2}(?::\d{2}){1,2}\s*\/\s*\d{1,2}(?::\d{2}){1,2}$/.test(text) || /^0:\d{2}$/.test(text)) continue;
+
+            const isSepFormat = /^\d{1,2}:\d{2}\s*(?:T[2-7]|CN|AM|PM)?$/i.test(text) ||
+                                /^\d{1,2}:\d{2}\s+\d{1,2}\s+Tháng\s+\d{1,2},?\s+\d{4}$/i.test(text) ||
+                                /^\d{1,2}\s+Tháng\s+\d{1,2}(?:,?\s*\d{4})?$/i.test(text) ||
+                                /^(?:Thứ (?:Hai|Ba|Tư|Năm|Sáu|Bảy)|Thứ [2-7]|Chủ Nhật|Chủ nhật|Hôm nay|Hôm Nay|Hôm qua|Today|Yesterday)$/i.test(text) ||
+                                /^(?:T[2-7]|CN)$/i.test(text) ||
+                                // DD/MM/YYYY (kèm giờ) - Business Suite render ngày đủ dạng này
+                                /^\d{1,2}\/\d{1,2}\/\d{4}(?:\s+\d{1,2}:\d{2})?$/i.test(text) ||
+                                /^\d{1,2}:\d{2}\s+\d{1,2}\/\d{1,2}\/\d{4}$/i.test(text) ||
+                                /^\d+\s+(?:giờ|phút|ngày)(?:\s+trước)?$/i.test(text);
+
+            if (isSepFormat) {
+                const isParentAlreadyAdded = separators.some(s => s.element.contains(el) || el.contains(s.element));
+                if (isParentAlreadyAdded) continue;
+
+                const parsed = sepParser(text, null);
+                if (parsed && parsed.timestamp_ms > 0) {
+                    separators.push({
+                        element: el,
+                        text: text,
+                        timestamp_ms: parsed.timestamp_ms
+                    });
+                }
+            }
+        }
+        return separators;
+    }
+
+    function collectMountedBatchMessages(container) {
+        if (!container) return [];
+        const parser = (typeof FbPageTimestampParser !== 'undefined' ? FbPageTimestampParser.parsePageTimestamp : null)
+            || (typeof window !== 'undefined' && window.FbPageTimestampParser ? window.FbPageTimestampParser.parsePageTimestamp : null);
+
+        const separators = findDateSeparatorsInContainer(container);
+        const currentThread = resolveCurrentThreadId();
+
+        const messageEls = Array.from(container.querySelectorAll('[data-message-id]'));
+        const likeCandidates = Array.from(container.querySelectorAll('svg, [role="img"], img[alt="👍"], img[alt*="thích" i], img[alt*="like" i], video'))
+            .filter(cand => {
+                if (cand.closest('[aria-label*="tùy chọn" i], [aria-label*="bày tỏ" i], [aria-label*="chuyển tiếp" i], [aria-label*="trả lời" i], button[aria-label*="menu" i], [data-surface*="composer"], form, footer')) {
+                    return false;
+                }
+                return isLikeElementOrWrapper(cand);
+            });
+
+        // Xây dựng danh sách các đơn vị tin nhắn (rawUnits)
+        const rawUnits = [];
+        const handledLikeNodes = new Set();
+
+        // 1. Duyệt qua các messageEls có sẵn
+        for (const el of messageEls) {
+            const fbMessageId = el.getAttribute('data-message-id');
+            if (!fbMessageId) continue;
+
+            const likesInside = likeCandidates.filter(cand => el.contains(cand));
+            if (likesInside.length === 0) {
+                // Tin nhắn bình thường (text hoặc media)
+                const resolved = resolveMessageContent(el);
+                if (resolved.kind !== 'none') {
+                    rawUnits.push({
+                        element: el,
+                        fbMessageId: fbMessageId,
+                        resolved: resolved,
+                        isStandaloneLike: false
+                    });
+                }
+            } else {
+                // Có nút Like bên trong messageEl
+                const rawText = (el.innerText || el.textContent || '').trim();
+                // Clean accessibility/metadata text (e.g. "Tin nhắn do X gửi lúc 20:11")
+                // before checking for substantial content. Without this, Like-only
+                // bubbles that contain accessibility labels are misidentified as text
+                // messages and lose their native mid.$ ID.
+                const _likeTextFilter = globalThis.FbCrmTextFilter || (typeof window !== 'undefined' && window.FbCrmTextFilter);
+                const _cleanedForLikeCheck = _likeTextFilter && typeof _likeTextFilter.cleanMessageText === 'function'
+                    ? _likeTextFilter.cleanMessageText(rawText)
+                    : rawText;
+                const hasSubstantialText = _cleanedForLikeCheck.length > 0 && _cleanedForLikeCheck !== '👍' && !/^(?:thích|like)$/i.test(_cleanedForLikeCheck);
+                if (hasSubstantialText) {
+                    rawUnits.push({
+                        element: el,
+                        fbMessageId: fbMessageId,
+                        resolved: { kind: 'text', text: rawText },
+                        isStandaloneLike: false
+                    });
+                }
+                for (let li = 0; li < likesInside.length; li++) {
+                    const likeNode = likesInside[li];
+                    handledLikeNodes.add(likeNode);
+                    rawUnits.push({
+                        element: likeNode,
+                        fbMessageId: li === 0 && !hasSubstantialText ? fbMessageId : null,
+                        resolved: { kind: 'text', text: '👍' },
+                        isStandaloneLike: true
+                    });
+                }
+            }
+        }
+
+        // 2. Thêm các likeCandidates độc lập nằm ngoài bất kỳ messageEl nào
+        for (const cand of likeCandidates) {
+            if (handledLikeNodes.has(cand)) continue;
+            handledLikeNodes.add(cand);
+            const ownMsgId = cand.getAttribute('data-message-id') || (cand.parentElement && cand.parentElement.getAttribute('data-message-id'));
+            rawUnits.push({
+                element: cand,
+                fbMessageId: ownMsgId || null,
+                resolved: { kind: 'text', text: '👍' },
+                isStandaloneLike: true
+            });
+        }
+
+        // 2.5. Harvest bubble KHÔNG có data-message-id (orphan): lời chào AI đầu
+        // hội thoại lead-quảng cáo, 👍 của khách render ngoài message container...
+        // Trước đây chỉ quét [data-message-id] nên những bubble này bị bỏ sót
+        // vĩnh viễn (reproduce 2026-09-28: thread Thành Lê Văn #1443 thiếu lời
+        // chào + 👍). Filter chặt: text 2..300 ký tự, qua cleanMessageText +
+        // isSystemOrMetadataText, loại button/banner/separator; id ổn định theo
+        // hash(thread + text) để không nhân bản qua các lượt crawl.
+        {
+            const textFilter = globalThis.FbCrmTextFilter || (typeof window !== 'undefined' && window.FbCrmTextFilter);
+            const orphanCandidates = container.querySelectorAll('div, span');
+            const orphanSeenText = new Set();
+            const unitElements = new Set(rawUnits.map(u => u.element).filter(Boolean));
+            for (const el of orphanCandidates) {
+                try {
+                    if (orphanSeenText.size >= 20) break; // giới hạn an toàn
+                    if (el.closest('[data-message-id]')) continue;
+                    if (unitElements.has(el)) continue;
+                    if (el.children.length > 2) continue;
+                    if (el.closest && el.closest('form, [role="textbox"], [data-surface*="composer"], footer, nav, header, video, [aria-label*="video" i], [data-surface*="video"]')) continue;
+                    if (el.closest && el.closest('[aria-label*="Phản hồi" i], [aria-label*="Chuyển tiếp" i], [aria-label*="bày tỏ" i], [aria-label*="Đánh dấu" i]')) continue;
+                    const raw = (el.innerText || '').trim();
+                    if (!raw || raw.length < 2 || raw.length > 300) continue;
+                    const cleanedBase = textFilter && typeof textFilter.cleanMessageText === 'function'
+                        ? textFilter.cleanMessageText(raw) : raw;
+                    if (!cleanedBase || cleanedBase.length < 2) continue;
+                    if (textFilter && typeof textFilter.isSystemOrMetadataText === 'function' && textFilter.isSystemOrMetadataText(cleanedBase)) continue;
+                    // 2026-09-29: Business Suite vẽ "Người gửi: <agent>" dưới mỗi tin
+                    // page gửi ra - orphan harvester từng nhặt dòng này thành tin riêng
+                    // hoặc dính đuôi bubble (reproduce: Trịnh Mạnh Nguyen #1443 - 3 row
+                    // page_orphan quanh 1 tin thật). Bỏ row attr-only, strip đuôi
+                    // attribution, rồi dedupe với tin thật đã harvest.
+                    if (textFilter && typeof textFilter.isBizSentByAttributionOnly === 'function' && textFilter.isBizSentByAttributionOnly(cleanedBase)) {
+                        // 2026-09-29: dòng "Người gửi: <agent>" -> gắn tên agent vào
+                        // tin đứng ngay trước nó (metadata sent_by) thay vì tạo tin rác.
+                        // Operator muốn biết ai gửi mà không muốn nó thành message.
+                        const agentName = cleanedBase.replace(/^Ng\u01b0\u1eddi g\u1eedi:?\s*/, '').trim();
+                        for (let u = rawUnits.length - 1; u >= 0; u--) {
+                            const cand = rawUnits[u];
+                            if (!cand.fbMessageId || !String(cand.fbMessageId).startsWith('mid.') || cand.sent_by) continue;
+                            const pos = cand.element.compareDocumentPosition(el);
+                            if (pos & Node.DOCUMENT_POSITION_FOLLOWING) { cand.sent_by = agentName || null; break; }
+                        }
+                        continue;
+                    }
+                    if (textFilter && typeof textFilter.isBizFeedbackOnly === 'function' && textFilter.isBizFeedbackOnly(cleanedBase)) continue;
+                    const cleaned = textFilter && typeof textFilter.stripBizSentByAttribution === 'function'
+                        ? textFilter.stripBizSentByAttribution(cleanedBase) : cleanedBase;
+                    if (!cleaned || cleaned.length < 2) continue;
+                    if (orphanSeenText.has(cleaned)) continue;
+                    if (rawUnits.some(u => (u.resolved && u.resolved.text) === cleaned)) continue;
+                    orphanSeenText.add(cleaned);
+
+                    const stableId = 'page_orphan_' + currentThread + '_' + (function (s) {
+                        let h = 5381;
+                        for (let i = 0; i < s.length; i++) { h = ((h << 5) + h + s.charCodeAt(i)) >>> 0; }
+                        return h.toString(36);
+                    })(cleaned);
+
+                    rawUnits.push({
+                        element: el,
+                        fbMessageId: stableId,
+                        resolved: { kind: 'text', text: cleaned },
+                        isStandaloneLike: false
+                    });
+                } catch (_) {}
+            }
+        }
+
+        // 3. Sắp xếp rawUnits theo ĐÚNG THỨ TỰ XUẤT HIỆN TỰ NHIÊN TRONG CÂY DOM (Top-to-Bottom)
+        rawUnits.sort((a, b) => {
+            if (a.element === b.element) return 0;
+            const pos = a.element.compareDocumentPosition(b.element);
+            if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+            if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+            return 0;
+        });
+
+        // 4. Xây dựng danh sách batch kết quả theo thứ tự DOM chuẩn
+        const list = [];
+        let lastKnownMsgId = null;
+        let likeCounterAfterAnchor = 0;
+        for (let i = 0; i < rawUnits.length; i++) {
+            const unit = rawUnits[i];
+            let fbMessageId = unit.fbMessageId;
+            if (fbMessageId && !unit.isStandaloneLike) {
+                lastKnownMsgId = fbMessageId;
+                likeCounterAfterAnchor = 0;
+            } else if (unit.isStandaloneLike) {
+                if (!fbMessageId || list.some(item => item.fb_message_id === fbMessageId) || !fbMessageId.startsWith('mid.')) {
+                    likeCounterAfterAnchor++;
+                    const anchorKey = lastKnownMsgId ? `after_${lastKnownMsgId}` : 'prefix';
+                    fbMessageId = `page_like_${currentThread}_${anchorKey}_${likeCounterAfterAnchor}`;
+                } else {
+                    lastKnownMsgId = fbMessageId;
+                    likeCounterAfterAnchor = 0;
+                }
+            } else if (!fbMessageId || list.some(item => item.fb_message_id === fbMessageId)) {
+                likeCounterAfterAnchor++;
+                const anchorKey = lastKnownMsgId ? `after_${lastKnownMsgId}` : 'prefix';
+                fbMessageId = `page_like_${currentThread}_${anchorKey}_${likeCounterAfterAnchor}`;
+            }
+
+            if (!fbMessageId) continue;
+            if (list.some(item => item.fb_message_id === fbMessageId)) {
+                continue;
+            }
+
+            const targetMeasure = unit.element;
+            const dirEvidence = getDirectionEvidence(targetMeasure, container);
+            const rawDir = dirEvidence.direction;
+            const isOutgoing = (rawDir === true || rawDir === 1)
+                ? true
+                : ((rawDir === false || rawDir === 0) ? false : null);
+
+            let parsedTs = 0;
+            let tsSource = 'unknown';
+
+            // A. Timestamp trên bubble nếu có parser
+            if (typeof parser === 'function' && !unit.isStandaloneLike) {
+                const p = parser(unit.element);
+                if (p && p.timestamp_ms > 0) {
+                    parsedTs = p.timestamp_ms;
+                    tsSource = p.timestamp_source;
+                }
+            }
+
+            // B. Date Separator xuất hiện trước hoặc ngay sau phần tử này
+            if (parsedTs === 0 && separators.length > 0) {
+                let matchingSep = null;
+                for (let sIdx = 0; sIdx < separators.length; sIdx++) {
+                    const sep = separators[sIdx];
+                    if (sep.element.compareDocumentPosition(unit.element) & Node.DOCUMENT_POSITION_FOLLOWING) {
+                        matchingSep = sep;
+                    } else {
+                        if (!matchingSep && sIdx === 0) {
+                            matchingSep = sep;
+                        }
+                        break;
+                    }
+                }
+                if (matchingSep) {
+                    parsedTs = matchingSep.timestamp_ms + (i * 10);
+                    tsSource = 'separator_date_clock';
+                }
+            }
+
+            // C. Fallback knownMessageTimestamps
+            if (parsedTs === 0 && knownMessageTimestamps.has(fbMessageId)) {
+                parsedTs = knownMessageTimestamps.get(fbMessageId);
+                tsSource = 'dom_order';
+            }
+
+            // Separator value (rank 4) GHI ĐÈ giá trị giờ-cào đã nằm trong map
+            // (drift từ zero-anchor trước đây) - đây là cơ chế tự lành dữ liệu.
+            // Giá trị không phải separator vẫn chỉ-set-khi-chưa-có như cũ.
+            if (parsedTs > 0 && (tsSource === 'separator_date_clock' || !knownMessageTimestamps.has(fbMessageId))) {
+                knownMessageTimestamps.set(fbMessageId, parsedTs);
+            }
+
+            const isMedia = unit.resolved.kind === 'media';
+            const text = isMedia ? (unit.resolved.caption || '') : unit.resolved.text;
+            let effectiveMediaUrl = isMedia ? unit.resolved.mediaUrl : null;
+            if (isMedia && unit.resolved.mediaType === 'video' && !effectiveMediaUrl) {
+                const vidCache = (typeof FbPageVideoDetector !== 'undefined' && FbPageVideoDetector.getVideoCache ? FbPageVideoDetector.getVideoCache() : null) ||
+                    (typeof window !== 'undefined' && window.FbPageVideoDetector?.getVideoCache ? window.FbPageVideoDetector.getVideoCache() : null);
+                const cached = vidCache?.get(fbMessageId);
+                const domAttr = unit.element?.getAttribute?.('data-crm-video-url') ||
+                    unit.element?.querySelector?.('[data-crm-video-url]')?.getAttribute?.('data-crm-video-url') ||
+                    unit.element?.getAttribute?.('data-crm-poster-url') ||
+                    unit.element?.querySelector?.('[data-crm-poster-url]')?.getAttribute?.('data-crm-poster-url');
+                effectiveMediaUrl = domAttr || cached?.videoUrl || cached?.posterUrl || null;
+                if (!effectiveMediaUrl && typeof FbPageVideoDetector !== 'undefined' && typeof FbPageVideoDetector.requestVideoResolutionFromMain === 'function') {
+                    FbPageVideoDetector.requestVideoResolutionFromMain(fbMessageId);
+                }
+            }
+
+            list.push({
+                fb_message_id: fbMessageId,
+                content: text,
+                media_type: isMedia ? (unit.resolved.mediaType || 'image') : 'text',
+                media_url: effectiveMediaUrl,
+                is_outgoing: isOutgoing,
+                direction_status: isOutgoing === null ? 'pending' : 'confirmed',
+                direction_confidence: isOutgoing === null ? 'unknown' : dirEvidence.confidence,
+                sent_by: unit.sent_by || null,
+                dom_order: i,
+                timestamp_ms: parsedTs,
+                timestamp_source: tsSource
+            });
+        }
+
+        // 5. Nội suy đơn điệu (Monotonic Interpolation) để các tin nhắn Like xen kẽ có timestamp tăng dần chuẩn xác
+        const orderedIds = list.map(item => item.fb_message_id);
+        const assignedTs = assignOrderedTimestamps(orderedIds);
+        for (let i = 0; i < list.length; i++) {
+            const item = list[i];
+            const mapped = assignedTs.get(item.fb_message_id);
+            if (mapped !== undefined) {
+                item.timestamp_ms = mapped;
+            } else if (knownMessageTimestamps.has(item.fb_message_id)) {
+                item.timestamp_ms = knownMessageTimestamps.get(item.fb_message_id);
+            }
+        }
+
+        return list;
+    }
+
+    function scrollBackForHistory() {
+        const threadId = resolveCurrentThreadId();
+        if (!threadId) return;
+        if (threadId !== lastScrollThreadId) {
+            lastScrollThreadId = threadId;
+            scrollAttemptsForThread = 0;
+        }
+        if (scrollAttemptsForThread >= MAX_SCROLL_ATTEMPTS_PER_THREAD) return;
+
+        const container = findScrollableMessageContainer();
+        if (!container) return;
+
+        if (container.scrollTop > 0) {
+            container.scrollTop = Math.max(0, container.scrollTop - container.clientHeight);
+            scrollAttemptsForThread++;
+            console.log(`[PageContent] Scroll-back for history: attempt ${scrollAttemptsForThread}/${MAX_SCROLL_ATTEMPTS_PER_THREAD}, thread=${threadId}`);
+        } else {
+            // Reached the top of whatever is currently mounted: either genuinely at
+            // the start of history, or Business Suite needs a "load more" click we
+            // don't perform yet. Stop trying for this thread either way.
+            scrollAttemptsForThread = MAX_SCROLL_ATTEMPTS_PER_THREAD;
+        }
+    }
+
+    function scanForMessages() {
+        if (isScanning) return;
+        isScanning = true;
+        currentTick++;
+        try {
+            // Early thread resolution to reset cache if needed, and try to find contact info
+            // ID tạm không đọc được (null) -> GIỮ NGUYÊN thread hiện tại:
+            // trước đây mỗi tick flap null<->id bị tính là "đổi thread" làm
+            // reset contact/signature/state machine và spam batch sync mỗi giây.
+            const resolvedThreadId = resolveCurrentThreadId();
+            if (!resolvedThreadId && !lastKnownBizThreadId) return;
+            const currentThreadId = resolvedThreadId || lastKnownBizThreadId;
+            lastKnownBizThreadId = currentThreadId;
+
+            const threadJustChanged = resolvedThreadId != null && currentThreadId !== lastKnownThreadId;
+            isLikelyBacklog(currentThreadId); // this updates lastKnownThreadId and resets cache if thread changed
+            if (threadJustChanged) {
+                lastThreadSwitchAt = Date.now();
+                currentContactName = null;
+                currentAvatarUrl = null;
+                currentProfileUrl = null;
+                currentAvatarSourceTier = 0;
+                lastReportedContactName = null;
+                lastReportedAvatarUrl = null;
+                lastReportedProfileUrl = null;
+                lastDiagThreadId = null;
+                lastSyncedMountedSignature = '';
+                seedTimestampAnchorsForThread(currentThreadId);
+            }
+
+            // Resolved once per tick and threaded through to both passes below
+            // (and into processPotentialMessage/walkBubbleAncestors), so every
+            // containment check this tick uses the exact same container node.
+            const messageListContainer = findMessageListContainer();
+            if (messageListContainer) markBizInboxHealthy();
+
+            const isInvalidName = (n) => {
+                if (globalThis.FbCrmTextFilter?.isInvalidContactName) {
+                    return globalThis.FbCrmTextFilter.isInvalidContactName(n);
+                }
+                if (!n || typeof n !== 'string') return true;
+                const str = n.trim();
+                return str.length < 2 || str.toLowerCase().includes('đã xem');
+            };
+
+            const cleanName = (n) => {
+                if (globalThis.FbCrmTextFilter?.cleanContactName) {
+                    return globalThis.FbCrmTextFilter.cleanContactName(n);
+                }
+                return isInvalidName(n) ? 'Khách hàng' : n.trim();
+            };
+
+            const urlParams = new URLSearchParams(window.location.search);
+            const assetId = urlParams.get('asset_id') || urlParams.get('mailbox_id') || null;
+
+            // 1. Trích xuất Tên khách hàng (currentContactName)
+            if (!currentContactName || isInvalidName(currentContactName)) {
+                // A. Ưu tiên tìm chính xác dòng của threadId này trong Sidebar
+                if (currentThreadId) {
+                    // Business Suite 2026+: dòng là span thread_row 0x0, không còn
+                    // <a> href — nhận diện dòng đúng qua React prop "threadID".
+                    for (const span of document.querySelectorAll('[data-surface*="thread_row"]')) {
+                        const visRow = findVisibleBizRowContainer(span);
+                        if (!visRow) continue;
+                        const rowThreadId = extractPageThreadIdFromFiber(visRow, assetId);
+                        if (!rowThreadId || String(rowThreadId) !== String(currentThreadId)) continue;
+                        const titleEl = visRow.querySelector('[data-surface*="thread_title"], h2, h3, h4, [role="heading"], [dir="auto"], strong, b');
+                        const rowTxt = (titleEl?.textContent || '').trim().split('\n')[0].trim();
+                        if (rowTxt && !isInvalidName(rowTxt) && rowTxt.length >= 2 && rowTxt.length <= 80 && !/^\d+$/.test(rowTxt)) {
+                            currentContactName = cleanName(rowTxt);
+                        }
+                        break;
+                    }
+                    const rowForThread = document.querySelector(`[role="navigation"] a[href*="${currentThreadId}"], [data-surface*="thread_list"] a[href*="${currentThreadId}"], a[href*="selected_item_id=${currentThreadId}"]`)?.closest('[role="row"], [role="listitem"], [data-surface*="thread_row"]');
+                    if (rowForThread) {
+                        const titleEl = rowForThread.querySelector('[data-surface*="thread_title"], h2, h3, h4, [role="heading"], [dir="auto"], strong, b');
+                        const rowTxt = (titleEl?.textContent || '').trim().split('\n')[0].trim();
+                        if (rowTxt && !isInvalidName(rowTxt) && rowTxt.length >= 2 && rowTxt.length <= 80 && !/^\d+$/.test(rowTxt)) {
+                            currentContactName = cleanName(rowTxt);
+                        }
+                    }
+                }
+
+                // B. Nếu chưa có và thời gian chuyển thread đã qua grace period (1.5s), mới lấy từ hàng active hoặc header
+                if ((!currentContactName || isInvalidName(currentContactName)) && (Date.now() - lastThreadSwitchAt >= 1500)) {
+                    const activeRow = document.querySelector('[role="navigation"] [aria-selected="true"], [role="gridcell"] [aria-selected="true"], [data-surface*="thread_list"] [aria-selected="true"], [aria-selected="true"], [aria-current="page"], [aria-current="true"]');
+                    if (activeRow) {
+                        const activeTitleEl = activeRow.querySelector('[data-surface*="thread_title"], h2, h3, h4, [role="heading"], [dir="auto"], strong, b');
+                        const activeTxt = (activeTitleEl?.textContent || activeRow.textContent || '').trim().split('\n')[0].trim();
+                        if (activeTxt && !isInvalidName(activeTxt) && activeTxt.length >= 2 && activeTxt.length <= 80 && !/^\d+$/.test(activeTxt)) {
+                            currentContactName = cleanName(activeTxt);
+                        }
+                    }
+
+                    if (!currentContactName || isInvalidName(currentContactName)) {
+                        // Business Suite 2026+: khung chat không dùng <header>/role=main
+                        // (header: Array(0) khi debug 2026-09-17); tên khách nằm trong
+                        // vùng [data-surface*="detail_column"]. Ưu tiên phần tử trên-
+                        // trái nhất vì tên luôn nằm đầu góc trái của khung chat.
+                        const headerEls = [
+                            ...Array.from(document.querySelectorAll('[data-surface*="detail_column"]')),
+                            ...Array.from(document.querySelectorAll('[role="main"] header h1, [role="main"] header h2, [role="main"] header [role="heading"], [role="main"] header [dir="auto"], [role="main"] [data-surface*="contact_name"], [role="main"] [data-surface*="profile_header"], [role="main"] header a[href*="facebook.com"]'))
+                        ].sort((a, b) => {
+                            try {
+                                const ra = a.getBoundingClientRect();
+                                const rb = b.getBoundingClientRect();
+                                return (Math.round(ra.top) - Math.round(rb.top)) || (Math.round(ra.left) - Math.round(rb.left));
+                            } catch (_) { return 0; }
+                        });
+                        for (const el of headerEls) {
+                            if (el.closest('[role="complementary"], [data-surface*="right_rail"], aside')) continue;
+                            const txt = (el.textContent || '').trim().split('\n')[0].trim();
+                            if (txt && !isInvalidName(txt) && txt.length >= 2 && txt.length <= 80 && !/^\d+$/.test(txt)) {
+                                currentContactName = cleanName(txt);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Compute mounted DOM signature for messageListContainer
+            let currentMountedSignature = '';
+            if (messageListContainer) {
+                const mountedMsgEls = messageListContainer.querySelectorAll('[data-message-id]');
+                const mountedLikes = messageListContainer.querySelectorAll('svg, [role="img"], img[alt="👍"], img[alt*="thích" i], img[alt*="like" i], video');
+                const mountedVideos = messageListContainer.querySelectorAll('video');
+                let videoSrcSignature = '';
+                for (let vi = 0; vi < mountedVideos.length; vi++) {
+                    const vel = mountedVideos[vi];
+                    const vSrc = vel.currentSrc || vel.src || vel.getAttribute('src') || vel.getAttribute('data-crm-video-url') || '';
+                    if (vSrc) {
+                        videoSrcSignature += `_v${vi}:${vSrc.substring(0, 40)}`;
+                    }
+                }
+                const firstMid = mountedMsgEls.length > 0 ? (mountedMsgEls[0].getAttribute('data-message-id') || '') : '';
+                const lastMid = mountedMsgEls.length > 0 ? (mountedMsgEls[mountedMsgEls.length - 1].getAttribute('data-message-id') || '') : '';
+                currentMountedSignature = `${currentThreadId}_${mountedMsgEls.length}_${mountedLikes.length}_${firstMid}_${lastMid}${videoSrcSignature}`;
+            }
+
+            // Kích hoạt Baselining theo State Machine khi thread mới mở và DOM đã mount tin nhắn
+            // HOẶC khi DOM thay đổi / mount thêm tin nhắn & Like mới trong lúc State Machine đã READY
+            const sm = getOrInitStateMachine(currentThreadId);
+            const canPassiveEmit = (Date.now() - lastPassiveEmitAt) >= 3000;
+            if (sm && sm.getState() === 'UNINITIALIZED' && messageListContainer && canPassiveEmit) {
+                const batchMessages = collectMountedBatchMessages(messageListContainer);
+                // Chỉ kích hoạt baselining khi DOM đã thực sự render ít nhất 1 tin nhắn (tránh gửi batch rỗng count=0)
+                if (batchMessages.length > 0) {
+                    lastPassiveEmitAt = Date.now();
+                    const meta = sm.startBaselining();
+                    lastSyncedOldestMessageId = batchMessages[0].fb_message_id;
+                    lastSyncedMountedSignature = currentMountedSignature;
+                    chrome.runtime.sendMessage({
+                        type: 'PAGE_THREAD_MESSAGES_SYNCED_V1',
+                        data: {
+                            thread_id: currentThreadId,
+                            account_id: null,
+                            page_id: assetId,
+                            session_epoch: meta.session_epoch,
+                            generation: meta.generation,
+                            scan_id: meta.scan_id,
+                            batch_sequence: meta.generation,
+                            mode: 'page_initial',
+                            contact_name: currentContactName || null,
+                            messages: batchMessages
+                        }
+                    });
+                }
+            } else if (sm && sm.getState() === 'READY' && !crawlInProgress && messageListContainer && currentMountedSignature && currentMountedSignature !== lastSyncedMountedSignature && canPassiveEmit) {
+                const batchMessages = collectMountedBatchMessages(messageListContainer);
+                if (batchMessages.length > 0) {
+                    lastPassiveEmitAt = Date.now();
+                    const meta = sm.startBaselining();
+                    lastSyncedOldestMessageId = batchMessages[0].fb_message_id;
+                    lastSyncedMountedSignature = currentMountedSignature;
+                    chrome.runtime.sendMessage({
+                        type: 'PAGE_THREAD_MESSAGES_SYNCED_V1',
+                        data: {
+                            thread_id: currentThreadId,
+                            account_id: null,
+                            page_id: assetId,
+                            session_epoch: meta.session_epoch,
+                            generation: meta.generation,
+                            scan_id: meta.scan_id,
+                            batch_sequence: meta.generation,
+                            mode: 'page_mounted_update',
+                            contact_name: currentContactName || null,
+                            messages: batchMessages
+                        }
+                    });
+                }
+            }
+
+            // 2. Trích xuất Avatar URL (currentAvatarUrl) đa tầng:
+            // Tier 2: Cột chi tiết khách hàng bên phải (Right Details Pane) - CHỈ lấy khi ĐÃ XÁC THỰC đúng khách hàng hiện tại
+            // Tier 1: Row của chính thread này trong Sidebar hoặc Header
+            let candidateAvatarUrl = null;
+            let candidateTier = 0;
+            const timeSinceSwitch = Date.now() - lastThreadSwitchAt;
+
+            // Tier 2: Quét cột bên phải (Right Details / Customer Info Pane)
+            // ĐIỀU KIỆN TIÊN QUYẾT CHO TIER 2:
+            // 1. Phải qua grace period kể từ lúc chuyển thread (ít nhất 1500ms) để DOM Meta kịp re-render
+            // 2. Cột bên phải PHẢI chứa tên khách hàng (currentContactName) hoặc threadId để tránh lấy nhầm DOM của người trước
+            const rightPane = document.querySelector('[role="complementary"], [data-surface*="details"], [data-surface*="contact"], [aria-label*="Chi tiết" i], [aria-label*="Details" i]');
+            let isRightPaneValid = false;
+            if (rightPane && timeSinceSwitch >= 1500) {
+                const rightPaneText = (rightPane.textContent || '').toLowerCase();
+                const cleanCurrentName = (currentContactName || '').toLowerCase().trim();
+
+                if (cleanCurrentName && cleanCurrentName.length >= 2 && cleanCurrentName !== 'khách hàng') {
+                    if (rightPaneText.includes(cleanCurrentName)) {
+                        isRightPaneValid = true;
+                    }
+                } else if (currentThreadId) {
+                    const idLink = rightPane.querySelector(`a[href*="${currentThreadId}"]`);
+                    if (idLink) {
+                        isRightPaneValid = true;
+                    }
+                }
+            }
+
+            // DIAGNOSTIC tạm (tìm link profile 2026-10-19): dump anchor trong
+            // right rail để phân biệt "Business Suite không có link profile"
+            // vs "link bị extractor từ chối". Xem data/composer-debug.log
+            // (kind=page_profile_diag). Bỏ khi kết luận xong.
+            if (currentThreadId && timeSinceSwitch >= 1500
+                && (currentThreadId !== lastDiagThreadId || Date.now() - lastDiagAt > 30000)) {
+                lastDiagThreadId = currentThreadId;
+                lastDiagAt = Date.now();
+                try {
+                    const diagRail = rightPane || document.querySelector('[role="complementary"]');
+                    const diagAnchors = diagRail
+                        ? Array.from(diagRail.querySelectorAll('a[href]')).slice(0, 25).map((a) => (a.getAttribute('href') || '').slice(0, 180))
+                        : [];
+                    chrome.runtime.sendMessage({
+                        type: 'CONTENT_DEBUG',
+                        data: {
+                            kind: 'page_profile_diag',
+                            thread_id: currentThreadId,
+                            right_pane: !!rightPane,
+                            right_pane_valid: !!isRightPaneValid,
+                            anchor_count: diagAnchors.length,
+                            anchors: diagAnchors
+                        }
+                    }).catch(() => {});
+                } catch (_) {}
+            }
+
+            if (isRightPaneValid && rightPane) {
+                const rightAvatar = extractAvatarFromElement(rightPane);
+                if (rightAvatar) {
+                    candidateAvatarUrl = rightAvatar;
+                    candidateTier = 2;
+                }
+                const rightProfile = extractProfileUrlFromElement(rightPane);
+                if (rightProfile) {
+                    currentProfileUrl = rightProfile;
+                }
+            }
+
+            // Tier 1: Nếu chưa có Tier 2 hợp lệ, lấy từ chính dòng (row) của threadId này trong Sidebar hoặc Header
+            if (!candidateAvatarUrl && currentAvatarSourceTier < 2) {
+                let threadRowImg = null;
+                if (currentThreadId) {
+                    const rowForThread = document.querySelector(`[role="navigation"] a[href*="${currentThreadId}"], [data-surface*="thread_list"] a[href*="${currentThreadId}"], a[href*="selected_item_id=${currentThreadId}"]`)?.closest('[role="row"], [role="listitem"], [data-surface*="thread_row"]');
+                    if (rowForThread) {
+                        threadRowImg = extractAvatarFromElement(rowForThread);
+                    }
+                }
+
+                if (threadRowImg) {
+                    candidateAvatarUrl = threadRowImg;
+                    candidateTier = 1;
+                } else if (timeSinceSwitch >= 1500) {
+                    // Fallback Header hoặc active row (chỉ sau grace period 1500ms)
+                    const headerEl = document.querySelector('[role="main"] header');
+                    const activeRow = document.querySelector('[role="navigation"] [aria-selected="true"], [role="gridcell"] [aria-selected="true"], [data-surface*="thread_list"] [aria-selected="true"], [aria-selected="true"], [aria-current="page"], [aria-current="true"]');
+                    const fallbackScopes = [headerEl, activeRow].filter(Boolean);
+                    for (const scope of fallbackScopes) {
+                        const avatar = extractAvatarFromElement(scope);
+                        if (avatar) {
+                            candidateAvatarUrl = avatar;
+                            candidateTier = 1;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Nâng cấp avatar nếu tìm thấy nguồn cấp cao hơn (Tier 2 > Tier 1) hoặc avatar mới
+            if (candidateAvatarUrl && (candidateTier > currentAvatarSourceTier || (!currentAvatarUrl && candidateTier >= currentAvatarSourceTier) || (candidateTier === currentAvatarSourceTier && candidateAvatarUrl !== currentAvatarUrl))) {
+                currentAvatarUrl = candidateAvatarUrl;
+                currentAvatarSourceTier = candidateTier;
+            }
+
+            // Phát hiện metadata mới -> gửi ngay sang background (chỉ gửi khi có thay đổi, khớp ID và qua grace period 1.5s)
+            if (currentThreadId && ((currentContactName && !isInvalidName(currentContactName)) || currentAvatarUrl || currentProfileUrl)) {
+                const activeIdNow = resolveCurrentThreadId();
+                if (String(activeIdNow) === String(currentThreadId) && (Date.now() - lastThreadSwitchAt >= 1500)) {
+                    if (lastReportedContactName !== currentContactName || lastReportedAvatarUrl !== currentAvatarUrl || lastReportedProfileUrl !== currentProfileUrl) {
+                        lastReportedContactName = currentContactName;
+                        lastReportedAvatarUrl = currentAvatarUrl;
+                        lastReportedProfileUrl = currentProfileUrl;
+                        chrome.runtime.sendMessage({
+                            type: 'UPDATE_THREAD_METADATA',
+                            data: {
+                                thread_id: currentThreadId,
+                                contact_name: currentContactName,
+                                avatar_url: currentAvatarUrl,
+                                profile_url: currentProfileUrl,
+                                page_id: assetId
+                            }
+                        });
+                    }
+                }
+            }
+
+            const messageEls = Array.from(document.querySelectorAll('[data-message-id]'));
+
+            // Trích xuất Date Separators để seed anchor thật cho knownMessageTimestamps
+            if (messageListContainer) {
+                const separators = findDateSeparatorsInContainer(messageListContainer);
+                if (separators.length > 0) {
+                    for (let i = 0; i < messageEls.length; i++) {
+                        const mEl = messageEls[i];
+                        const mId = mEl.getAttribute('data-message-id');
+                        if (!mId) continue;
+                        let matchingSep = null;
+                        for (let sIdx = 0; sIdx < separators.length; sIdx++) {
+                            const sep = separators[sIdx];
+                            if (sep.element.compareDocumentPosition(mEl) & Node.DOCUMENT_POSITION_FOLLOWING) {
+                                matchingSep = sep;
+                            } else {
+                                break;
+                            }
+                        }
+                        if (matchingSep) {
+                            knownMessageTimestamps.set(mId, matchingSep.timestamp_ms + (i * 10));
+                        }
+                    }
+                }
+            }
+
+            const orderedIds = messageEls.map(n => n.getAttribute('data-message-id'));
+            assignOrderedTimestamps(orderedIds);
+
+            // Only the first text-node fragment of a given message wrapper is
+            // processed per tick; the rest of that wrapper's fragments (e.g. emoji
+            // splitting a bubble into multiple text nodes) are folded into the full
+            // wrapper text instead of being sent/dropped as separate fragments.
+            const processedWrappersThisTick = new Set();
+
+            // Feature 023 (FR-002): without a resolved message-list container
+            // there is no safe scope to test containment against - skip the
+            // whole-document text scan for this tick entirely instead of
+            // falling back to unscoped scanning (which is how non-chat UI text
+            // used to leak in as fake messages).
+            if (messageListContainer && messageListContainer !== document.body) {
+                const walker = document.createTreeWalker(messageListContainer, NodeFilter.SHOW_TEXT, null, false);
+                let node;
+                while (node = walker.nextNode()) {
+                    const text = node.nodeValue.trim();
+                    if (text.length > 0) {
+                        const el = node.parentElement;
+                        if (el && !isExcludedElement(el) && el.tagName !== 'SCRIPT' && el.tagName !== 'STYLE' && el.tagName !== 'A' && el.tagName !== 'BUTTON' && !el.closest('a') && !el.closest('button')) {
+                            processPotentialMessage(el, text, processedWrappersThisTick, messageListContainer);
+                        }
+                    }
+                }
+            }
+
+            // Feature 018: a bubble whose entire content is non-text (a
+            // picker emoji, a sticker, or a photo) has zero text nodes inside
+            // it, so the TreeWalker above never visits it and
+            // processPotentialMessage is never called for it. This second
+            // pass catches exactly those wrappers - anything already handled
+            // above via a real text node is skipped via the shared
+            // processedWrappersThisTick set.
+            for (const wrapperEl of messageEls) {
+                if (processedWrappersThisTick.has(wrapperEl)) continue;
+                processedWrappersThisTick.add(wrapperEl);
+                const resolvedContent = resolveMessageContent(wrapperEl);
+                if (resolvedContent.kind === 'none') continue;
+                const fbMessageId = wrapperEl.getAttribute('data-message-id');
+                const { isInsideMessageBubble, inChatContainer } = walkBubbleAncestors(wrapperEl, messageListContainer);
+                forwardResolvedMessage(wrapperEl, wrapperEl, fbMessageId, isInsideMessageBubble, inChatContainer, resolvedContent, messageListContainer);
+            }
+
+            // Pass 2b (Direct Thumbs Up / Like Scanner):
+            // Quét các nút Like độc lập xuất hiện trong khung chat mà không có [data-message-id]
+            if (messageListContainer) {
+                const standaloneLikes = Array.from(messageListContainer.querySelectorAll('svg, [role="img"], img[alt="👍"], img[alt*="thích" i], img[alt*="like" i], video'))
+                    .filter(cand => {
+                        if (cand.closest('[aria-label*="tùy chọn" i], [aria-label*="bày tỏ" i], [aria-label*="chuyển tiếp" i], [aria-label*="trả lời" i], button[aria-label*="menu" i], [data-surface*="composer"], form, footer')) {
+                            return false;
+                        }
+                        return isLikeElementOrWrapper(cand);
+                    });
+
+                for (const likeNode of standaloneLikes) {
+                    const parentMsg = likeNode.closest('[data-message-id]');
+                    if (parentMsg && processedWrappersThisTick.has(parentMsg)) continue;
+                    if (processedWrappersThisTick.has(likeNode)) continue;
+                    processedWrappersThisTick.add(likeNode);
+                    if (parentMsg) processedWrappersThisTick.add(parentMsg);
+
+                    const fbMessageId = parentMsg?.getAttribute?.('data-message-id') || likeNode.getAttribute?.('data-message-id') || null;
+                    const { isInsideMessageBubble, inChatContainer } = walkBubbleAncestors(likeNode, messageListContainer);
+                    forwardResolvedMessage(likeNode, likeNode, fbMessageId, isInsideMessageBubble, inChatContainer, { kind: 'text', text: '👍' }, messageListContainer);
+                }
+            }
+
+            // Pass 3 (Call Log): Quét span[dir="auto"] TRONG KHUNG CHAT (messageListContainer)
+            var callSpans = messageListContainer ? messageListContainer.querySelectorAll('span[dir="auto"]') : [];
+            for (var ci = 0; ci < callSpans.length; ci++) {
+                var spanEl = callSpans[ci];
+                var spanText = (spanEl.textContent || '').trim();
+                var lowerSpan = spanText.toLowerCase();
+                if (!spanText) continue;
+                if (!lowerSpan.includes('cuộc gọi') && !lowerSpan.includes('nhỡ') && !lowerSpan.includes('bỏ lỡ')) continue;
+
+                var { isInsideMessageBubble, inChatContainer } = walkBubbleAncestors(spanEl, messageListContainer);
+                if (!inChatContainer || !isInsideMessageBubble) continue;
+
+                var threadId = resolveCurrentThreadId();
+                if (!threadId || threadId === 'UNKNOWN_THREAD') continue;
+                // Ưu tiên data-message-id thật (mid.$) để backend gộp với dòng
+                // mà history scan đã lưu - id tổng hợp từng khiến 1 cuộc gọi
+                // thành 2 bong bóng.
+                var midCarrier = spanEl.closest('[data-message-id]');
+                var realMid = midCarrier ? midCarrier.getAttribute('data-message-id') : null;
+                var callId = (realMid && /^mid\./i.test(realMid))
+                    ? realMid
+                    : 'call_' + threadId + '_' + spanText.replace(/\s+/g, '_');
+
+                if (processedHashes.has(callId)) continue;
+                processedHashes.add(callId);
+
+                console.log('[CALL_SCANNER] Phat hien cuoc goi: "' + spanText + '" | ID: ' + callId);
+
+                chrome.runtime.sendMessage({
+                    type: 'NEW_PAGE_MESSAGE_FROM_DOM',
+                    data: {
+                        thread_id: threadId,
+                        fb_message_id: callId,
+                        content: spanText,
+                        is_outgoing: false,
+                        direction_status: 'confirmed',
+                        direction_source: 'call_log_pass',
+                        direction_confidence: 'high',
+                        source: 'page_dom_observer',
+                        timestamp_ms: Date.now(),
+                        timestamp_source: 'realtime_fallback',
+                        contact_name: currentContactName || null
+                    }
+                });
+            }
+
+        } finally {
+            isScanning = false;
+        }
+    }
+
+    // Single ancestor walk used by processPotentialMessage for two purposes at
+    // once: (a) the pending-id tracking below needs a stable-ish reference to
+    // "the bubble" for a message that has no data-message-id yet, using the
+    // same dir="auto" ancestor the structural filter already looks for; (b)
+    // the existing inChatContainer/isInsideMessageBubble structural filter.
+    // Computing both in one pass avoids walking the same ancestor chain twice.
+    //
+    // Feature 023: inChatContainer used to be decided by this same upward walk
+    // independently accepting the first role="main"/role="grid" ancestor it
+    // found - but Business Suite reuses those roles for unrelated widgets
+    // (confirmed live: the account/page switcher panel can share the exact
+    // same broad region as the real message list, whose own aria-label admits
+    // it holds "tin nhắn, gợi ý và chỉ báo đăng nhập" - not messages only).
+    // inChatContainer is now a direct containment test against the specific
+    // container findMessageListContainer() resolved from a real
+    // [data-message-id] anchor, passed in by the caller, instead of a second
+    // independent guess.
+    function walkBubbleAncestors(element, messageListContainer) {
+        let bubbleAncestor = null;
+        let isInsideMessageBubble = false;
+        let currNode = element;
+
+        while (currNode && currNode !== document.body) {
+            if (currNode.getAttribute && currNode.getAttribute('dir') === 'auto') {
+                isInsideMessageBubble = true;
+                if (!bubbleAncestor) bubbleAncestor = currNode;
+            }
+            currNode = currNode.parentElement;
+        }
+
+        const inChatContainer = !!(messageListContainer && messageListContainer.contains(element));
+
+        return { bubbleAncestor, isInsideMessageBubble, inChatContainer };
+    }
+
+    // Feature 018: resolves what a [data-message-id] wrapper actually
+    // contains when it has no (or no useful) text node for the TreeWalker to
+    // find - a picker emoji, a sticker, or a photo. Priority: real text >
+    // picker-emoji alt > media (img src or CSS background-image). Verified
+    // live against three real samples in the same test thread:
+    //   - emoji:  <img alt="💩" src=".../emoji.php/v9/.../1f4a9.png">
+    //   - photo/img-sticker (DOM-identical, can't be told apart): <img alt
+    //     class="img" src="https://scontent...fbcdn.net/v/t1.15752-9/...">
+    //   - CSS-background sticker (no <img> at all): <div role="img"
+    //     aria-label="Joyful Plans, characters leaning in and rubbing hands
+    //     together gleefully sticker" style="background-image:url('https://
+    //     scontent...fbcdn.net/v/t39.1997-6/....webp?...')">
+    // The emoji/media split on <img> is by alt shape, not by hostname: an
+    // empty alt means "no text to show" (media); a short, letter-free alt is
+    // a real Unicode character (emoji), as opposed to the multi-word English
+    // caption sentences Facebook auto-generates for aria-label on the
+    // CSS-background case, which are never mistaken for emoji text since
+    // aria-label is only read on the role="img" div path below.
+    function isLikeElementOrWrapper(node, rawText) {
+        if (!node) return false;
+
+        // 1. Kiểm tra text trực tiếp
+        const trimmed = (rawText || '').trim();
+        if (trimmed === '👍') return true;
+        if (/^(?:thích|like|biểu tượng thích|biểu tượng cảm xúc thích|gửi biểu tượng thích|thumbs up)$/i.test(trimmed)) {
+            return true;
+        }
+
+        // 2. Kiểm tra aria-label trên chính wrapper hoặc phần tử gốc
+        const wrapperAria = (node.getAttribute?.('aria-label') || '').trim().toLowerCase();
+        if (wrapperAria) {
+            if (wrapperAria === 'thích' || wrapperAria === 'like' || wrapperAria === 'thumbs up' || wrapperAria === 'biểu tượng thích' || wrapperAria === 'gửi biểu tượng thích') {
+                return true;
+            }
+            if (/^(?:tin nhắn.*:)?\s*(?:thích|like|biểu tượng thích|thumbs up|nhãn dán thích)$/i.test(wrapperAria)) {
+                return true;
+            }
+            if (wrapperAria.includes('biểu tượng thích') || wrapperAria.includes('thumbs up') || wrapperAria.includes('nhãn dán thích')) {
+                return true;
+            }
+        }
+
+        // 3. QuerySelector các phần tử mang nhãn Like trong cây DOM của bubble
+        const likeSelectorEl = node.querySelector?.(
+            '[aria-label*="biểu tượng thích" i], [aria-label*="thumbs up" i], [aria-label*="nhãn dán thích" i], ' +
+            '[aria-label="Thích" i], [aria-label="Like" i], [aria-label="thích" i], [aria-label="like" i], ' +
+            'svg[aria-label*="Thích" i], svg[aria-label*="Like" i], ' +
+            '[role="img"][aria-label*="Thích" i], [role="img"][aria-label*="Like" i]'
+        );
+        if (node.matches?.(
+            '[aria-label*="biểu tượng thích" i], [aria-label*="thumbs up" i], [aria-label*="nhãn dán thích" i], ' +
+            '[aria-label="Thích" i], [aria-label="Like" i], [aria-label="thích" i], [aria-label="like" i], ' +
+            'svg[aria-label*="Thích" i], svg[aria-label*="Like" i], ' +
+            '[role="img"][aria-label*="Thích" i], [role="img"][aria-label*="Like" i]'
+        )) {
+            return true;
+        }
+        if (likeSelectorEl) {
+            return true;
+        }
+
+        // 4. Kiểm tra SVG thumbs up trong Meta Business Suite
+        const isSvgNode = node.tagName && node.tagName.toLowerCase() === 'svg';
+        const svgs = isSvgNode ? [node] : Array.from(node.querySelectorAll?.('svg') || []);
+        for (const svg of svgs) {
+            // Loại trừ các nút bấm điều khiển video, hành động phụ (bày tỏ, tùy chọn, chuyển tiếp) hoặc composer
+            if (svg.closest('video, [data-surface*="video"], .video-player, [data-testid*="video"], [aria-label*="tùy chọn" i], [aria-label*="bày tỏ" i], [aria-label*="chuyển tiếp" i], [aria-label*="trả lời" i], button[aria-label*="menu" i], [data-surface*="composer"], form, footer')) {
+                continue;
+            }
+            const vb = (svg.getAttribute('viewBox') || '').trim();
+            const title = (svg.querySelector?.('title')?.textContent || '').trim().toLowerCase();
+            if (title === 'thích' || title === 'like' || title.includes('thumbs up') || title.includes('biểu tượng thích')) {
+                return true;
+            }
+
+            const svgAria = (svg.getAttribute('aria-label') || '').toLowerCase();
+            if (svgAria.includes('thích') || svgAria.includes('like') || svgAria.includes('thumbs up')) {
+                return true;
+            }
+
+            const isStandardLikeVb = vb.includes('16') || vb.includes('20') || vb.includes('24') || vb.includes('28') || vb.includes('32') || vb.includes('36') || vb.includes('40') || vb.includes('48') || vb.includes('64');
+            const fill = (svg.getAttribute('fill') || svg.innerHTML || '').toLowerCase();
+            const isBlueLikeSvg = fill.includes('0084ff') || fill.includes('0a7cff') || fill.includes('0099ff') || fill.includes('rgb(0, 132, 255)') || fill.includes('rgb(10, 124, 255)') || fill.includes('rgb(0,132,255)');
+            if (isStandardLikeVb && isBlueLikeSvg && !svg.closest('[data-testid*="status"]') && !svg.closest('[aria-label*="Đã gửi" i]') && !svg.closest('[aria-label*="Đã chuyển" i]')) {
+                return true;
+            }
+        }
+
+        // 5. Kiểm tra Sticker / Image thumbs up
+        const isImgNode = node.tagName && node.tagName.toLowerCase() === 'img';
+        const imgs = isImgNode ? [node] : Array.from(node.querySelectorAll?.('img[src]') || []);
+        for (const img of imgs) {
+            const src = img.getAttribute('src') || '';
+            const alt = (img.getAttribute('alt') || '').trim().toLowerCase();
+
+            if (alt === '👍' || alt === 'thích' || alt === 'like' || alt.includes('biểu tượng thích') || alt.includes('thumbs up') || alt.includes('nhãn dán thích')) {
+                return true;
+            }
+
+            if (src.includes('369239263222822') || src.includes('like_sticker') || src.includes('thumbs-up') || src.includes('thumbsup')) {
+                return true;
+            }
+        }
+
+        // 6. Kiểm tra [role="img"] với CSS background-image
+        const isBgNode = node.getAttribute?.('role') === 'img';
+        const bgEls = isBgNode ? [node] : Array.from(node.querySelectorAll?.('[role="img"]') || []);
+        for (const bgEl of bgEls) {
+            const bgAria = (bgEl.getAttribute('aria-label') || '').toLowerCase();
+            if (bgAria === 'thích' || bgAria === 'like' || bgAria.includes('biểu tượng thích') || bgAria.includes('thumbs up') || bgAria.includes('nhãn dán thích')) {
+                return true;
+            }
+            const style = bgEl.getAttribute('style') || '';
+            if (style.includes('369239263222822') || style.includes('like_sticker')) {
+                return true;
+            }
+        }
+
+        // 7. Kiểm tra video sticker hoạt họa của nút Like (Facebook animated thumbs up video/sticker)
+        const isVidNode = node.tagName && node.tagName.toLowerCase() === 'video';
+        const vids = isVidNode ? [node] : Array.from(node.querySelectorAll?.('video') || []);
+        for (const vid of vids) {
+            const vidAria = (vid.getAttribute('aria-label') || vid.getAttribute('title') || '').toLowerCase();
+            if (vidAria.includes('thích') || vidAria.includes('like') || vidAria.includes('thumbs up') || vidAria.includes('biểu tượng thích')) {
+                return true;
+            }
+            const vidWrapper = vid.closest?.('[aria-label*="thích" i], [aria-label*="like" i], [aria-label*="thumbs up" i], [aria-label*="biểu tượng thích" i]');
+            if (vidWrapper) {
+                return true;
+            }
+            if (trimmed === '👍' || /^(?:thích|like|biểu tượng thích)$/i.test(trimmed)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // Caption của media trong Business Suite đôi khi render NGOÀI container
+    // [data-message-id] (sibling ngay dưới media, không có message-id riêng)
+    // — innerText của container không bao gồm nó nên caption bị mất (content
+    // rỗng, reproduce 2026-09-24: caption "ảnh"/"video" biến mất). Tìm tối đa
+    // 2 sibling kế tiếp: bỏ qua phần tử có message-id riêng; text ngắn đi qua
+    // cleanVideoCaption (loại duration, GIỮ chữ người dùng gõ).
+    function findAdjacentCaptionBubble(messageIdNode) {
+        try {
+            let node = messageIdNode.nextElementSibling;
+            let hops = 0;
+            const videoDetector = globalThis.FbPageVideoDetector || (typeof window !== 'undefined' && window.FbPageVideoDetector);
+            while (node && hops < 2) {
+                if (node.getAttribute && node.getAttribute('data-message-id')) return null;
+                const txt = (node.innerText || node.textContent || '').trim();
+                if (txt && txt.length <= 200) {
+                    const cleaned = (videoDetector && typeof videoDetector.cleanVideoCaption === 'function')
+                        ? videoDetector.cleanVideoCaption(txt)
+                        : txt;
+                    if (cleaned) return cleaned;
+                }
+                node = node.nextElementSibling;
+                hops++;
+            }
+        } catch (_) {}
+        return null;
+    }
+
+    function resolveMessageContent(messageIdNode) {
+        const rawText = (messageIdNode.innerText || messageIdNode.textContent || '').trim();
+        const textFilter = globalThis.FbCrmTextFilter || (typeof window !== 'undefined' && window.FbCrmTextFilter);
+        const cleanedText = textFilter && typeof textFilter.cleanMessageText === 'function'
+            ? textFilter.cleanMessageText(rawText)
+            : rawText;
+
+        // Call Log Guard: Never treat a call notification wrapper (which may contain avatar/icon <img>) as an image attachment!
+        const lowerRawText = rawText.toLowerCase();
+        if (rawText && (lowerRawText.includes('cuộc gọi') || lowerRawText.includes('bỏ lỡ') || lowerRawText.includes('đã nhỡ') || lowerRawText.includes('nhỡ'))) {
+            return { kind: 'text', text: rawText };
+        }
+
+        // Ưu tiên kiểm tra Video bằng pageVideoDetector chuyên biệt cho Page trước
+        const videoDetector = globalThis.FbPageVideoDetector || (typeof window !== 'undefined' && window.FbPageVideoDetector);
+        if (videoDetector && typeof videoDetector.detectPageVideo === 'function') {
+            const videoResult = videoDetector.detectPageVideo(messageIdNode, cleanedText || rawText);
+            if (videoResult && videoResult.isVideo) {
+                const domVid = messageIdNode.getAttribute?.('data-crm-video-url') || messageIdNode.querySelector?.('[data-crm-video-url]')?.getAttribute?.('data-crm-video-url');
+                const domPoster = messageIdNode.getAttribute?.('data-crm-poster-url') || messageIdNode.querySelector?.('[data-crm-poster-url]')?.getAttribute?.('data-crm-poster-url');
+                return {
+                    kind: 'media',
+                    mediaType: 'video',
+                    mediaUrl: videoResult.mediaUrl || domVid || domPoster || null,
+                    caption: videoResult.caption || findAdjacentCaptionBubble(messageIdNode) || null
+                };
+            }
+        }
+
+        // Kiểm tra Nút Thích / Like (Thumbs Up 👍) sau khi đã loại trừ video
+        if (isLikeElementOrWrapper(messageIdNode, cleanedText || rawText)) {
+            return { kind: 'text', text: '👍' };
+        }
+
+        const imgs = messageIdNode.querySelectorAll('img[src]');
+        for (const img of imgs) {
+            const src = img.getAttribute('src') || '';
+            if (!src || src.includes('/emoji.php') || src.includes('/rsrc.php')) continue;
+
+            const alt = (img.getAttribute('alt') || '').toLowerCase();
+            if (alt.includes('ảnh đại diện') || alt.includes('profile picture') || alt.includes('biểu tượng cảm xúc')) continue;
+
+            const isAvatar = img.closest && img.closest('[aria-label*="Ảnh đại diện"], [aria-label*="profile"], [data-surface*="profile"]');
+            if (isAvatar) continue;
+            if ((img.width > 0 && img.width <= 36) || (img.height > 0 && img.height <= 36)) continue;
+
+            return { kind: 'media', mediaUrl: src, caption: (cleanedText || rawText) || findAdjacentCaptionBubble(messageIdNode) || null };
+        }
+
+        const bgEls = messageIdNode.querySelectorAll('[role="img"]');
+        for (const bgEl of bgEls) {
+            const style = bgEl.getAttribute('style') || '';
+            const match = style.match(/background-image\s*:\s*url\((['"]?)([^'")]+)\1\)/);
+            if (match) {
+                const url = match[2];
+                if (url && !url.includes('/emoji.php') && !url.includes('/rsrc.php')) {
+                    const aria = (bgEl.getAttribute('aria-label') || '').toLowerCase();
+                    if (!aria.includes('ảnh đại diện') && !aria.includes('profile picture') && !aria.includes('biểu tượng cảm xúc')) {
+                        return { kind: 'media', mediaUrl: url, caption: (cleanedText || rawText) || bgEl.getAttribute('aria-label') || null };
+                    }
+                }
+            }
+        }
+
+        // Kiểm tra xem rawText có phải chỉ toàn chuỗi thời gian/hệ thống hay không
+        const isMetadataOnly = textFilter && typeof textFilter.isSystemOrMetadataText === 'function'
+            ? textFilter.isSystemOrMetadataText(rawText)
+            : (/^\d{1,2}:\d{2}/.test(rawText));
+
+        if (cleanedText && !isMetadataOnly) {
+            return { kind: 'text', text: cleanedText };
+        } else if (rawText && !isMetadataOnly) {
+            return { kind: 'text', text: rawText };
+        }
+
+        for (const img of imgs) {
+            const alt = (img.getAttribute('alt') || '').trim();
+            if (alt && (alt === '👍' || /^(?:thích|like)$/i.test(alt))) {
+                return { kind: 'text', text: '👍' };
+            }
+            if (alt && alt.length <= 8 && !/[A-Za-z]/.test(alt)) {
+                return { kind: 'emoji_text', text: alt };
+            }
+        }
+
+        return { kind: 'none' };
+    }
+
+    // Shared identity/dedup/forward tail for both entry points: the
+    // text-node TreeWalker pass (via processPotentialMessage) and the
+    // per-wrapper media pass (in scanForMessages, for wrappers with no text
+    // node at all). isInsideMessageBubble/inChatContainer are passed in
+    // rather than recomputed here so each entry point only walks the
+    // ancestor chain once (see walkBubbleAncestors).
+    function forwardResolvedMessage(messageIdNode, anchorElement, fbMessageId, isInsideMessageBubble, inChatContainer, resolvedContent, messageListContainer) {
+        if (resolvedContent.kind === 'none') return;
+
+        const directionEvidence = getDirectionEvidence(messageIdNode || anchorElement, messageListContainer);
+        const rawDir = directionEvidence.direction;
+        const isOutgoing = (rawDir === true || rawDir === 1)
+            ? true
+            : ((rawDir === false || rawDir === 0)
+                ? false
+                : null);
+
+        // ID hiện tại ưu tiên tuyệt đối; khi DOM tạm không đọc được (URL thiếu
+        // selected_item_id, không có aria-selected) dùng lastKnown thay vì bỏ tin.
+        const threadId = resolveCurrentThreadId() || lastKnownBizThreadId;
+        if (!threadId) return;
+
+        const assetId = resolveCurrentPageId();
+
+        let parsedTs = 0;
+        let tsSource = 'unknown';
+        const parser = (typeof FbPageTimestampParser !== 'undefined' ? FbPageTimestampParser.parsePageTimestamp : null)
+            || (typeof window !== 'undefined' && window.FbPageTimestampParser ? window.FbPageTimestampParser.parsePageTimestamp : null);
+
+        if (typeof parser === 'function') {
+            const p = parser(messageIdNode || anchorElement);
+            if (p && p.timestamp_ms > 0) {
+                parsedTs = p.timestamp_ms;
+                tsSource = p.timestamp_source;
+            }
+        }
+        if (parsedTs === 0 && messageListContainer) {
+            const separators = findDateSeparatorsInContainer(messageListContainer);
+            if (separators.length > 0) {
+                const targetNode = messageIdNode || anchorElement;
+                let matchingSep = null;
+                for (let sIdx = 0; sIdx < separators.length; sIdx++) {
+                    const sep = separators[sIdx];
+                    if (sep.element.compareDocumentPosition(targetNode) & Node.DOCUMENT_POSITION_FOLLOWING) {
+                        matchingSep = sep;
+                    } else {
+                        break;
+                    }
+                }
+                if (matchingSep) {
+                    const isLiveSession = !crawlInProgress && !isLikelyBacklog(threadId);
+                    if (isLiveSession && Date.now() - matchingSep.timestamp_ms > 120000) {
+                        parsedTs = Date.now();
+                        tsSource = 'realtime_fallback';
+                    } else {
+                        parsedTs = matchingSep.timestamp_ms;
+                        tsSource = 'separator_date_clock';
+                    }
+                }
+            }
+        }
+        if (parsedTs === 0 && fbMessageId && knownMessageTimestamps.has(fbMessageId)) {
+            parsedTs = knownMessageTimestamps.get(fbMessageId);
+            tsSource = 'dom_order';
+        } else if (parsedTs === 0 && !isLikelyBacklog(threadId)) {
+            parsedTs = Date.now();
+            tsSource = 'realtime_fallback';
+        }
+
+        const isMedia = resolvedContent.kind === 'media';
+        const text = isMedia ? (resolvedContent.caption || '') : resolvedContent.text;
+
+        const isCallLog = Boolean(text && (
+            text.includes('Cuộc gọi thoại') ||
+            text.includes('Cuộc gọi video') ||
+            text.includes('cuộc gọi') ||
+            text.includes('bỏ lỡ')
+        ));
+
+        let effectiveFbMessageId = fbMessageId;
+        if (text === '👍' && messageListContainer) {
+            const isLive = !crawlInProgress && !isLikelyBacklog(threadId);
+            if (!isLive) {
+                // Đang crawl backlog hoặc kéo tin cũ: để Batch Sync quản lý chính xác thứ tự DOM
+                return;
+            }
+            // Trong phiên live: cho phép phát sự kiện thời gian thực và ép tính lại signature
+            lastSyncedMountedSignature = '';
+            if (!effectiveFbMessageId) {
+                effectiveFbMessageId = 'page_like_' + threadId + '_' + (parsedTs || Date.now()) + '_' + (isOutgoing === true ? 'out' : 'in');
+            }
+        }
+
+        const dedupKey = effectiveFbMessageId || text + '_' + (isOutgoing === null ? 'unknown' : isOutgoing);
+        const hash = threadId + '_' + dedupKey;
+        if (processedHashes.has(hash)) return;
+
+        if (!inChatContainer || isExcludedElement(messageIdNode || anchorElement)) {
+            return;
+        }
+
+        if (!isMedia) {
+            const textFilter = globalThis.FbCrmTextFilter || (typeof window !== 'undefined' && window.FbCrmTextFilter);
+            if (textFilter && typeof textFilter.isSystemOrMetadataText === 'function') {
+                if (textFilter.isSystemOrMetadataText(text)) return;
+            }
+
+            const lowerText = text.toLowerCase();
+            if (!isInsideMessageBubble && !isCallLog) {
+                const sysTexts = ['xem thêm', 'đang tải...', 'chưa đọc'];
+                if (sysTexts.some(t => lowerText.includes(t))) return;
+            }
+
+            const switcherPanelTexts = ['tài sản doanh nghiệp', 'tài khoản của bạn', 'trang quản lý tài sản doanh nghiệp'];
+            if (switcherPanelTexts.some(t => lowerText.includes(t))) return;
+
+            if (/thêm tin nhắn được cá nhân h(?:óa|oá)/i.test(text)) return;
+
+            if (/^\d{1,2}:\d{2}\s+\d{1,2}\s+Tháng\s+\d{1,2},?\s+\d{4}$/i.test(text) ||
+                /^\d{1,2}\s+Tháng\s+\d{1,2}(?:,?\s*\d{4})?$/i.test(text)) return;
+
+            if (/^(?:Thứ (?:Hai|Ba|Tư|Năm|Sáu|Bảy)|Chủ Nhật|Hôm nay|Hôm qua|Today|Yesterday)$/i.test(text)) return;
+        }
+
+        if (isOutgoing !== null) {
+            processedHashes.add(hash);
+            unresolvedHashFirstSeenTick.delete(hash);
+        } else {
+            const firstSeen = unresolvedHashFirstSeenTick.get(hash);
+            if (firstSeen === undefined) {
+                unresolvedHashFirstSeenTick.set(hash, currentTick);
+            } else if (currentTick - firstSeen >= MAX_UNRESOLVED_DIRECTION_TICKS) {
+                processedHashes.add(hash);
+                unresolvedHashFirstSeenTick.delete(hash);
+            }
+        }
+
+        console.log('[PageContent] Detected new message in thread ' + threadId + ': ' + (text || '').substring(0, 30) + ' (Outgoing: ' + (isOutgoing === null ? 'unknown' : isOutgoing) + ', ts=' + tsSource + ', kind=' + resolvedContent.kind + ')');
+
+        const payloadData = {
+            thread_id: threadId,
+            fb_message_id: effectiveFbMessageId,
+            content: text,
+            is_outgoing: isOutgoing,
+            direction_status: isOutgoing === null ? 'pending' : 'confirmed',
+            direction_source: directionEvidence.source,
+            direction_confidence: isOutgoing === null ? 'unknown' : directionEvidence.confidence,
+            page_id: assetId,
+            page_name: lastReportedPageName || null,
+            source: 'page_dom_observer',
+            timestamp_ms: parsedTs,
+            timestamp_source: tsSource,
+            telemetry: {
+                t_dom: Date.now()
+            }
+        };
+        if (isMedia) {
+            payloadData.media_type = resolvedContent.mediaType || 'image';
+            payloadData.media_url = resolvedContent.mediaUrl;
+        }
+        if (currentContactName) payloadData.contact_name = currentContactName;
+        if (currentAvatarUrl) payloadData.avatar_url = currentAvatarUrl;
+
+        const sm = getOrInitStateMachine(threadId);
+        if (sm && sm.getState() === 'BASELINING') {
+            sm.bufferRealtimeMessage(payloadData);
+            return;
+        }
+
+        // Feature 055: Realtime Leak Guard - khóa luồng phát NEW_PAGE_MESSAGE_FROM_DOM
+        // khi Active Crawler đang cuộn kéo lịch sử tin nhắn cũ.
+        if (crawlInProgress) {
+            return;
+        }
+
+        chrome.runtime.sendMessage({
+            type: 'NEW_PAGE_MESSAGE_FROM_DOM',
+            data: payloadData
+        });
+    }
+
+    function processPotentialMessage(element, text, processedWrappersThisTick, messageListContainer) {
+        let messageIdNode = element.closest('[data-message-id]');
+        let fbMessageId = messageIdNode ? messageIdNode.getAttribute('data-message-id') : null;
+
+        if (messageIdNode) {
+            if (processedWrappersThisTick.has(messageIdNode)) return;
+            processedWrappersThisTick.add(messageIdNode);
+        }
+
+        const { bubbleAncestor, isInsideMessageBubble, inChatContainer } = walkBubbleAncestors(element, messageListContainer);
+
+        if (!fbMessageId) {
+            if (bubbleAncestor) {
+                const pending = pendingNoIdBubbles.get(bubbleAncestor);
+                if (!pending) {
+                    pendingNoIdBubbles.set(bubbleAncestor, { firstSeenTick: currentTick });
+                    return;
+                }
+                if (currentTick - pending.firstSeenTick < MAX_PENDING_TICKS) {
+                    return;
+                }
+                pendingNoIdBubbles.delete(bubbleAncestor);
+            }
+        } else if (bubbleAncestor && pendingNoIdBubbles.has(bubbleAncestor)) {
+            pendingNoIdBubbles.delete(bubbleAncestor);
+        }
+
+        const resolvedContent = messageIdNode ? resolveMessageContent(messageIdNode) : { kind: 'text', text };
+        forwardResolvedMessage(messageIdNode, element, fbMessageId, isInsideMessageBubble, inChatContainer, resolvedContent, messageListContainer);
+    }
+
+    // Lắng nghe phản hồi link CDN video từ MAIN world (injected.js)
+    window.addEventListener('message', (event) => {
+        if (event.data?.type === 'CRM_RESOLVE_PAGE_VIDEO_RESPONSE') {
+            const { fb_message_id, videoUrl, posterUrl } = event.data;
+            if (fb_message_id && videoUrl) {
+                const escaped = typeof CSS !== 'undefined' && CSS.escape ? CSS.escape(fb_message_id) : fb_message_id;
+                const msgNode = document.querySelector(`[data-message-id="${escaped}"]`) ||
+                    document.querySelector(`[data-id="${escaped}"]`);
+                if (msgNode) {
+                    msgNode.setAttribute('data-crm-video-url', videoUrl);
+                    if (posterUrl) msgNode.setAttribute('data-crm-poster-url', posterUrl);
+                    const vEl = msgNode.querySelector('video');
+                    if (vEl) {
+                        vEl.setAttribute('data-crm-video-url', videoUrl);
+                        if (posterUrl) vEl.setAttribute('data-crm-poster-url', posterUrl);
+                    }
+                }
+                lastSyncedMountedSignature = '';
+            }
+        }
+    });
+
+    // Khi một thẻ video nạp xong link src/metadata từ mạng, reset signature để kích hoạt đồng bộ tức thì
+    document.addEventListener('loadeddata', (e) => {
+        if (e.target && e.target.tagName === 'VIDEO') {
+            lastSyncedMountedSignature = '';
+        }
+    }, true);
+    document.addEventListener('loadedmetadata', (e) => {
+        if (e.target && e.target.tagName === 'VIDEO') {
+            lastSyncedMountedSignature = '';
+        }
+    }, true);
+
+    // Message listener for ACK and on-demand batch synchronization requests from background
+    chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+        if (request.type === 'PAGE_BATCH_ACK') {
+            const ack = request.data;
+            if (threadSM && ack && ack.thread_id === threadSM.threadId) {
+                const flushed = threadSM.handleAck(ack);
+                if (Array.isArray(flushed)) {
+                    for (const msg of flushed) {
+                        chrome.runtime.sendMessage({
+                            type: 'NEW_PAGE_MESSAGE_FROM_DOM',
+                            data: msg
+                        });
+                    }
+                }
+            }
+        } else if (request.type === 'SCAN_PAGE_SIDEBAR') {
+            const isDeep = Boolean(request.data?.deep);
+            lastSidebarSyncHash = '';
+            lastSidebarSyncTime = 0;
+            if (isDeep) {
+                scrollPageSidebarDeeply(request.data || {}).then(res => {
+                    sendResponse({ success: true, ...res });
+                }).catch(err => {
+                    sendResponse({ success: false, error: err?.message || String(err) });
+                });
+                return true;
+            } else {
+                const threads = scanPageSidebarThreads(true);
+                sendResponse({ success: true, count: threads?.length || 0 });
+            }
+        } else if (request.type === 'TRIGGER_DEEP_SIDEBAR_SCAN') {
+            scrollPageSidebarDeeply(request.data || {}).then(res => {
+                sendResponse({ success: true, ...res });
+            }).catch(err => {
+                sendResponse({ success: false, error: err?.message || String(err) });
+            });
+            return true;
+        } else if (request.type === 'REQUEST_PAGE_BATCH_SYNC') {
+            const req = request.data || {};
+            const threadId = req.thread_id || resolveCurrentThreadId();
+            if (!threadId) return;
+
+            // Verify route: conversation đang mount trên DOM phải đúng thread
+            // được yêu cầu. Sai route -> báo background và KHÔNG thu thập gì
+            // (tránh gán nhầm tin của khách khác vào thread này).
+            const expectedBareId = String(req.expected_bare_id || bareThreadIdOf(req.thread_id) || '');
+            const verifyThreadRoute = () => {
+                if (!expectedBareId) return true;
+                const currentId = resolveCurrentThreadId();
+                if (currentId && String(currentId) === expectedBareId) return true;
+                if (!currentId && req.contact_name) {
+                    const headerName = getVisibleBizChatHeaderName();
+                    if (headerName && looseNameMatch(headerName, req.contact_name)) return true;
+                }
+                return false;
+            };
+
+            // Feature 055: Mutex coalescing - ngăn nhiều request crawl chạy song song cho cùng 1 thread
+            const crawlToken = crawlMutex.acquire(threadId);
+            if (!crawlToken) {
+                console.log(`[PageContent] Bỏ qua REQUEST_PAGE_BATCH_SYNC: thread ${threadId} đang có crawler hoạt động.`);
+                return;
+            }
+
+            crawlInProgress = true;
+
+            (async () => {
+                try {
+                    if (!verifyThreadRoute()) {
+                        console.warn(`[PageContent] 🚫 THREAD_ROUTE_MISMATCH: yêu cầu thread ${expectedBareId} nhưng DOM đang mở ${resolveCurrentThreadId() || 'không rõ'}. Hủy crawl, không thu thập tin.`);
+                        chrome.runtime.sendMessage({
+                            type: 'PAGE_THREAD_ROUTE_MISMATCH',
+                            data: { thread_id: threadId, expected_bare_id: expectedBareId, current_thread_id: resolveCurrentThreadId(), page_id: req.page_id || null }
+                        }).catch(() => {});
+                        crawlMutex.release(crawlToken);
+                        crawlInProgress = false;
+                        return;
+                    }
+
+                    const scrollerHelper = typeof FbPageActiveScroller !== 'undefined' ? FbPageActiveScroller : null;
+                    const accumulator = scrollerHelper && typeof scrollerHelper.createMessageAccumulator === 'function'
+                        ? scrollerHelper.createMessageAccumulator()
+                        : {
+                            _list: [],
+                            accumulate: function(arr) { this._list = [...this._list, ...arr]; return this._list.length; },
+                            getAll: function() { return this._list; }
+                        };
+
+                    const container = findMessageListContainer();
+                    const initialBatch = collectMountedBatchMessages(container);
+                    accumulator.accumulate(initialBatch);
+
+                    const isOlderMode = req.mode === 'page_scroll_older' || req.mode === 'ondemand_older' || String(req.mode || '').includes('older') || Boolean(req.cursor?.oldest_message_id);
+                    const targetOldestId = (req.cursor && req.cursor.oldest_message_id) ? req.cursor.oldest_message_id : null;
+
+                    if (isOlderMode && scrollerHelper) {
+                        const scroller = findScrollableMessageContainer();
+                        if (scroller) {
+                            const beforeTop = scroller.scrollTop;
+                            const beforeHeight = scroller.scrollHeight;
+                            const className = scroller.className ? String(scroller.className).slice(0, 80) : '';
+
+                            try {
+                                chrome.runtime.sendMessage({
+                                    type: 'PAGE_SCROLLER_DEBUG',
+                                    data: {
+                                        thread_id: threadId,
+                                        stage: 'SCROLLER_FOUND',
+                                        class_name: className,
+                                        client_height: scroller.clientHeight,
+                                        scroll_height: beforeHeight,
+                                        scroll_top: beforeTop
+                                    }
+                                });
+                            } catch (e) {}
+
+                            const maxRounds = 4;
+                            let isReachedTop = false;
+                            for (let round = 0; round < maxRounds; round++) {
+                                // Kiểm tra khẩn cấp: nếu người dùng đã đổi thread hoặc iframe reload -> hủy crawler ngay
+                                // (ID tạm thời không đọc được coi như "vẫn thread cũ" - verifyThreadRoute lo phần đúng/sai)
+                                const nowResolvedId = resolveCurrentThreadId() || threadId;
+                                if (!crawlMutex.isTokenValid(crawlToken, nowResolvedId)) {
+                                    console.warn(`[PageContent] Hủy crawler: thread đã đổi từ ${threadId} sang ${resolveCurrentThreadId()} tại vòng ${round + 1}`);
+                                    return;
+                                }
+                                if (!verifyThreadRoute()) {
+                                    console.warn(`[PageContent] 🚫 THREAD_ROUTE_MISMATCH tại vòng ${round + 1}: yêu cầu ${expectedBareId}, DOM đang mở ${resolveCurrentThreadId() || 'không rõ'}. Dừng crawl.`);
+                                    chrome.runtime.sendMessage({
+                                        type: 'PAGE_THREAD_ROUTE_MISMATCH',
+                                        data: { thread_id: threadId, expected_bare_id: expectedBareId, current_thread_id: resolveCurrentThreadId(), page_id: req.page_id || null, round: round + 1 }
+                                    }).catch(() => {});
+                                    return;
+                                }
+
+                                const stepDistance = scrollerHelper.calculateStepDistance(scroller.clientHeight);
+                                scrollerHelper.dispatchScrollGestures(scroller, stepDistance, { forceToTop: true });
+
+                                try {
+                                    chrome.runtime.sendMessage({
+                                        type: 'PAGE_SCROLLER_DEBUG',
+                                        data: {
+                                            thread_id: threadId,
+                                            stage: 'SCROLLED_TO_TOP',
+                                            round: round + 1,
+                                            before_top: beforeTop,
+                                            after_top: scroller.scrollTop,
+                                            scroll_height: scroller.scrollHeight
+                                        }
+                                    });
+                                } catch (e) {}
+
+                                const settleRes = await scrollerHelper.waitForDomSettle(scroller, {
+                                    mode: 'older',
+                                    maxWaitMs: 6500,
+                                    minWaitMs: 1200,
+                                    pollIntervalMs: 50,
+                                    getFirstMessageId: () => {
+                                        const firstEl = container ? container.querySelector('[data-message-id]') : null;
+                                        return firstEl ? firstEl.getAttribute('data-message-id') : null;
+                                    }
+                                });
+
+                                // Chụp snapshot ngay khi vòng này settle -> đưa vào accumulator trước khi React unmount!
+                                const countBefore = accumulator.getCount();
+                                const roundBatch = collectMountedBatchMessages(container);
+                                accumulator.accumulate(roundBatch);
+                                const countAfter = accumulator.getCount();
+                                const newlyAdded = countAfter - countBefore;
+
+                                try {
+                                    chrome.runtime.sendMessage({
+                                        type: 'PAGE_SCROLLER_DEBUG',
+                                        data: {
+                                            thread_id: threadId,
+                                            stage: 'DOM_SETTLED',
+                                            round: round + 1,
+                                            has_growth: settleRes.hasGrowth,
+                                            new_messages_count: newlyAdded,
+                                            total_accumulated: countAfter,
+                                            scroll_height: scroller.scrollHeight
+                                        }
+                                    });
+                                } catch (e) {}
+
+                                // Kiểm tra điều kiện dừng:
+                                // 1. Chạm mốc tin cũ đã biết (targetOldestId)
+                                const allSoFar = accumulator.getAll();
+                                if (targetOldestId && allSoFar.some(m => m.fb_message_id === targetOldestId)) {
+                                    console.log(`[PageContent] Đã chạm mốc tin cũ ${targetOldestId} tại vòng ${round + 1}. Dừng crawler.`);
+                                    break;
+                                }
+
+                                // 2. Nếu không phát hiện tăng trưởng DOM (đã chạm đỉnh) -> dừng
+                                if (!settleRes.hasGrowth && newlyAdded === 0) {
+                                    if (round >= 1 || (isOlderMode && scroller.scrollTop <= 20)) {
+                                        console.log(`[PageContent] Không phát hiện tăng trưởng DOM tại vòng ${round + 1} (top=${scroller.scrollTop}). Đã chạm nóc (reached_top). Dừng crawler.`);
+                                        isReachedTop = true;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            // Bắt buộc cuộn trả lại đáy để Facebook mount lại các tin nhắn mới nhất
+                            try {
+                                scroller.scrollTop = scroller.scrollHeight;
+                                await scrollerHelper.waitForDomSettle(scroller, {
+                                    maxWaitMs: 1500,
+                                    pollIntervalMs: 50
+                                });
+                                const bottomBatch = collectMountedBatchMessages(container);
+                                accumulator.accumulate(bottomBatch);
+                            } catch (_) {}
+                        } else {
+                            try {
+                                chrome.runtime.sendMessage({
+                                    type: 'PAGE_SCROLLER_DEBUG',
+                                    data: {
+                                        thread_id: threadId,
+                                        stage: 'SCROLLER_NOT_FOUND'
+                                    }
+                                });
+                            } catch (e) {}
+                        }
+                    }
+
+                    // Kiểm tra thread lần cuối trước khi đóng gói gửi backend
+                    // ID tạm không đọc được (null) coi như "vẫn thread cũ" - route
+                    // đã được verifyThreadRoute kiểm tra trước và trong mỗi vòng.
+                    const currentThreadNow = resolveCurrentThreadId() || threadId;
+                    if (!crawlMutex.isTokenValid(crawlToken, currentThreadNow)) {
+                        console.warn(`[PageContent] Hủy phát batch: thread hiện tại (${currentThreadNow}) không khớp token (${threadId}).`);
+                        return;
+                    }
+
+                    const batchMessages = accumulator.getAll();
+
+                    // Khởi động State Machine và bắt đầu đếm timeout 10s TẠI ĐÂY (chỉ sau khi crawl xong)
+                    const sm = getOrInitStateMachine(threadId);
+                    const meta = sm ? sm.startBaselining() : { session_epoch: 'epoch_1', generation: 1, scan_id: 'scan_1' };
+
+                    let boundaryEvidence = null;
+                    const prevOldest = targetOldestId || lastSyncedOldestMessageId;
+                    if (prevOldest) {
+                        const overlapItem = batchMessages.find(m => m.fb_message_id === prevOldest);
+                        boundaryEvidence = {
+                            previous_oldest_message_id: prevOldest,
+                            crawler_confirmed_scroll: true,
+                            overlap_id: overlapItem ? overlapItem.fb_message_id : null
+                        };
+                    }
+
+                    if (batchMessages.length > 0) {
+                        lastSyncedOldestMessageId = batchMessages[0].fb_message_id;
+                    }
+
+                    const assetId = req.page_id || resolveCurrentPageId() || null;
+
+                    chrome.runtime.sendMessage({
+                        type: 'PAGE_THREAD_MESSAGES_SYNCED_V1',
+                        data: {
+                            thread_id: threadId,
+                            account_id: req.account_id || null,
+                            page_id: assetId,
+                            page_name: lastReportedPageName || null,
+                            session_epoch: meta.session_epoch,
+                            generation: meta.generation,
+                            scan_id: meta.scan_id,
+                            batch_sequence: 1,
+                            mode: req.mode || (isOlderMode ? 'page_scroll_older' : 'page_initial'),
+                            contact_name: (String(threadId) === String(resolveCurrentThreadId()) ? (currentContactName || null) : null),
+                            boundary_evidence: boundaryEvidence,
+                            reached_top: Boolean(isReachedTop),
+                            messages: batchMessages
+                        }
+                    });
+                } catch (err) {
+                    console.error('[PageContent] Lỗi trong quá trình Active Crawl:', err);
+                } finally {
+                    crawlMutex.release(crawlToken);
+                    crawlInProgress = false;
+                }
+            })();
+        }
+    });
+
+    // Tự động cào danh sách hội thoại từ Sidebar của Meta Business Suite
+    let lastSidebarSyncHash = '';
+    let lastSidebarSyncTime = 0;
+    let lastSidebarScanDiag = '';
+    let deepSidebarScanInProgress = false;
+
+    function findSidebarScrollContainer() {
+        // 1. Dò từ các phần tử dòng hoặc link hội thoại trong Cột 2
+        const rowEl = document.querySelector('[data-surface*="thread_row"], [data-crm-thread-id], a[href*="selected_item_id="]')
+            || document.querySelector('[role="row"], [role="listitem"]');
+        if (rowEl) {
+            let curr = rowEl.parentElement;
+            while (curr && curr !== document.body && curr !== document.documentElement) {
+                const rect = curr.getBoundingClientRect();
+                if (rect.left >= 0 && rect.left <= 600 && rect.height >= 250) {
+                    const style = window.getComputedStyle(curr);
+                    const overflowY = style.overflowY || '';
+                    if (['auto', 'scroll', 'overlay'].includes(overflowY) && curr.scrollHeight > curr.clientHeight) {
+                        return curr;
+                    }
+                }
+                curr = curr.parentElement;
+            }
+        }
+
+        // 2. Dò theo thuộc tính container danh sách Cột 2
+        const candidates = Array.from(document.querySelectorAll('[data-surface*="thread_list"], [role="grid"], [role="navigation"] div, div[style*="overflow"]')).filter(el => {
+            try {
+                const rect = el.getBoundingClientRect();
+                if (rect.left >= 0 && rect.left <= 600 && rect.width >= 160 && rect.height >= 250) {
+                    const style = window.getComputedStyle(el);
+                    const overflowY = style.overflowY || '';
+                    return ['auto', 'scroll', 'overlay'].includes(overflowY) && el.scrollHeight > el.clientHeight;
+                }
+                return false;
+            } catch (_) { return false; }
+        });
+
+        if (candidates.length > 0) {
+            const withRows = candidates.find(c => c.querySelector('[data-surface*="thread_row"], [role="row"], a[href*="selected_item_id="]'));
+            if (withRows) return withRows;
+            candidates.sort((a, b) => b.scrollHeight - a.scrollHeight);
+            return candidates[0];
+        }
+
+        return null;
+    }
+
+    async function scrollPageSidebarDeeply({ maxRounds = 35, stepDistance = 600 } = {}) {
+        if (deepSidebarScanInProgress) {
+            console.log('[PageContent] Deep sidebar scan is already in progress, skipping duplicate.');
+            return { running: true, inProgress: true };
+        }
+        deepSidebarScanInProgress = true;
+        console.log(`[PageContent] 📜 Bắt đầu cuộn sâu Sidebar Business Suite (maxRounds=${maxRounds}, stepDistance=${stepDistance}px)...`);
+
+        try {
+            const scroller = findSidebarScrollContainer();
+            if (!scroller) {
+                console.warn('[PageContent] Không tìm thấy scroll container của Sidebar Business Suite. Quét tại chỗ.');
+                const threads = scanPageSidebarThreads(true);
+                return { totalThreads: threads?.length || 0, rounds: 0, reason: 'no_scroller_found' };
+            }
+
+            const allDiscovered = new Map();
+            let consecutiveNoGrowthRounds = 0;
+            let lastHeight = scroller.scrollHeight;
+            let actualRounds = 0;
+
+            const initialThreads = scanPageSidebarThreads(true) || [];
+            for (const t of initialThreads) allDiscovered.set(String(t.id), t);
+
+            for (let round = 1; round <= maxRounds; round++) {
+                actualRounds = round;
+                const prevCount = allDiscovered.size;
+
+                scroller.scrollTop += stepDistance;
+                scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
+
+                // Chờ DOM settle và tải thêm dữ liệu ảo hóa (~1100ms)
+                await new Promise(r => setTimeout(r, 1100));
+
+                const roundThreads = scanPageSidebarThreads(true) || [];
+                for (const t of roundThreads) allDiscovered.set(String(t.id), t);
+
+                const newlyAdded = allDiscovered.size - prevCount;
+                const currentHeight = scroller.scrollHeight;
+
+                console.log(`[PageContent] [DEEP_SIDEBAR] Vòng ${round}/${maxRounds}: +${newlyAdded} threads (Tổng: ${allDiscovered.size}), scrollTop=${scroller.scrollTop}/${scroller.scrollHeight}`);
+
+                const isAtBottom = scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 50;
+                if (newlyAdded === 0 && (isAtBottom || currentHeight === lastHeight)) {
+                    consecutiveNoGrowthRounds++;
+                    if (consecutiveNoGrowthRounds >= 3) {
+                        console.log(`[PageContent] [DEEP_SIDEBAR] Dừng: 3 vòng liên tiếp không có hội thoại mới hoặc đã chạm đáy.`);
+                        break;
+                    }
+                } else {
+                    consecutiveNoGrowthRounds = 0;
+                }
+                lastHeight = currentHeight;
+            }
+
+            try {
+                scroller.scrollTo({ top: 0, behavior: 'smooth' });
+            } catch (_) {
+                scroller.scrollTop = 0;
+            }
+
+            console.log(`[PageContent] ✅ Hoàn thành cuộn sâu Sidebar: tìm thấy tổng cộng ${allDiscovered.size} hội thoại sau ${actualRounds} vòng.`);
+            return { totalThreads: allDiscovered.size, rounds: actualRounds, success: true };
+        } catch (err) {
+            console.error('[PageContent] Lỗi khi cuộn sâu Sidebar:', err);
+            throw err;
+        } finally {
+            deepSidebarScanInProgress = false;
+        }
+    }
+
+    function scanPageSidebarThreads(force = false) {
+        try {
+            const now = Date.now();
+            if (!force && now - lastSidebarSyncTime < 1000) return [];
+
+            // Yêu cầu MAIN world (injected.js) quét và đóng dấu fiber
+            try { window.postMessage({ type: 'CRM_EXTRACT_BIZ_SIDEBAR_REQUEST' }, '*'); } catch (_) {}
+
+            const urlParams = new URLSearchParams(window.location.search);
+            const pageId = urlParams.get('asset_id') || urlParams.get('mailbox_id') || null;
+            const currentSelectedId = resolveCurrentThreadId();
+
+            const isInvalidText = (txt) => {
+                if (globalThis.FbCrmTextFilter?.isInvalidContactName) {
+                    return globalThis.FbCrmTextFilter.isInvalidContactName(txt);
+                }
+                if (!txt || typeof txt !== 'string') return true;
+                const s = txt.trim();
+                return s.length < 2 || /^(?:Tất cả tin nhắn|Tất cả|Hộp thư đến|Inbox|Spam|Tin nhắn|Facebook|Messenger|Meta)$/i.test(s);
+            };
+
+            // ƯU TIÊN (Business Suite 2026+): dòng hội thoại là span
+            // [data-surface*="thread_row"] inline 0x0 — mọi bộ lọc theo tọa độ
+            // đều loại nhầm (đã reproduce 2026-09-17: chỉ cào được 1 hội thoại
+            // vì nhặt nhầm 2 link menu trái chứa selected_item_id). Phải đi lên
+            // ancestor gần nhất có kích thước thật (DIV ~366x38) làm dòng.
+            const rowCandidates = [];
+            const seenElements = new Set();
+
+            // 0. ƯU TIÊN SỐ 1: Các phần tử đã được injected.js (MAIN world) bóc tách và đóng dấu sẵn data-crm-thread-id
+            const stampedNodes = Array.from(document.querySelectorAll('[data-crm-thread-id]'));
+            for (const sn of stampedNodes) {
+                const visRow = findVisibleBizRowContainer(sn) || sn;
+                if (visRow && !seenElements.has(visRow) && !visRow.closest('[data-message-id], [data-surface*="message_list"], form')) {
+                    seenElements.add(visRow);
+                    rowCandidates.push(visRow);
+                }
+            }
+
+            // 1. ƯU TIÊN SỐ 2 (Business Suite 2026+): dòng hội thoại là span
+            // [data-surface*="thread_row"] inline 0x0 — mọi bộ lọc theo tọa độ
+            // đều loại nhầm (đã reproduce 2026-09-17: chỉ cào được 1 hội thoại
+            // vì nhặt nhầm 2 link menu trái chứa selected_item_id). Phải đi lên
+            // ancestor gần nhất có kích thước thật (DIV ~366x38) làm dòng.
+            const bizRowSpans = Array.from(document.querySelectorAll('[data-surface*="thread_row"]'));
+            if (bizRowSpans.length > 0) markBizInboxHealthy();
+            for (const span of bizRowSpans) {
+                const visRow = findVisibleBizRowContainer(span);
+                if (visRow && !seenElements.has(visRow) && !visRow.closest('[data-message-id], [data-surface*="message_list"], form')) {
+                    seenElements.add(visRow);
+                    rowCandidates.push(visRow);
+                }
+            }
+
+            // Fallback cho DOM cũ (avatar/link/role=row) — chỉ chạy khi không có dòng kiểu mới
+            if (!rowCandidates.length) {
+
+                // 1. Tìm qua các avatar tròn ở Cột 2
+                const avatars = Array.from(document.querySelectorAll('img, svg image, [style*="background-image"]')).filter(el => {
+                    try {
+                        const rect = el.getBoundingClientRect();
+                        return rect.width >= 24 && rect.width <= 80 && rect.left >= 40 && rect.left <= 480 && rect.top >= 40 &&
+                            !el.closest('[data-message-id], [role="main"] header, [role="complementary"], form');
+                    } catch (_) { return false; }
+                });
+
+                for (const av of avatars) {
+                    const row = av.closest('[role="row"], [role="listitem"], [data-surface*="thread_row"], [tabindex="0"]') || av.parentElement?.parentElement;
+                    if (row && !seenElements.has(row) && !row.closest('[data-message-id], [role="main"] header, [role="complementary"], form')) {
+                        try {
+                            const rect = row.getBoundingClientRect();
+                            if (rect.left >= 40 && rect.left <= 500 && rect.height >= 30) {
+                                seenElements.add(row);
+                                rowCandidates.push(row);
+                            }
+                        } catch (_) {}
+                    }
+                }
+
+                // 2. Tìm qua các thẻ link có selected_item_id hoặc thread_id trong Cột 2
+                const links = Array.from(document.querySelectorAll('a[href*="selected_item_id="], a[href*="thread_id="], a[href*="/messages/t/"], a[href*="/messages/e2ee/t/"]')).filter(a => {
+                    try {
+                        const rect = a.getBoundingClientRect();
+                        return rect.left >= 40 && rect.left <= 500 && !a.closest('[data-message-id], [role="main"] header, [role="complementary"], form');
+                    } catch (_) { return false; }
+                });
+
+                for (const a of links) {
+                    const row = a.closest('[role="row"], [role="listitem"], [data-surface*="thread_row"], [tabindex="0"]') || a;
+                    if (row && !seenElements.has(row)) {
+                        seenElements.add(row);
+                        rowCandidates.push(row);
+                    }
+                }
+
+                // 3. Quét các phần tử có role="row" hoặc role="listitem" hoặc data-surface*="thread" trong Cột 2
+                const standardRows = Array.from(document.querySelectorAll('[data-surface*="thread_row"], [role="row"], [role="listitem"]')).filter(el => {
+                    try {
+                        const rect = el.getBoundingClientRect();
+                        return rect.left >= 40 && rect.left <= 500 && rect.height >= 35 && rect.width >= 150 &&
+                            !el.closest('[data-message-id], [role="main"] header, [role="complementary"], form');
+                    } catch (_) { return false; }
+                });
+
+                for (const r of standardRows) {
+                    if (!seenElements.has(r)) {
+                        seenElements.add(r);
+                        rowCandidates.push(r);
+                    }
+                }
+            }
+
+            const discoveredThreads = [];
+            const seenIds = new Set();
+
+            for (const row of rowCandidates) {
+                try {
+                    let threadId = null;
+
+                    // A. React Fiber với prop ĐẶC THÙ thread (Business Suite 2026+ đặt
+                    //    ID trong prop "threadID" - D hoa; bản cũ tìm "threadId" nên
+                    //    trượt và rơi xuống prop generic id/userId gây gộp thread)
+                    threadId = extractPageThreadIdFromFiber(row, pageId);
+
+                    // B. Trích xuất từ thẻ <a> (DOM cũ)
+                    if (!threadId) {
+                        const rowLinks = row.tagName === 'A' ? [row] : Array.from(row.querySelectorAll('a[href]'));
+                        for (const l of rowLinks) {
+                            const href = l.getAttribute('href') || l.href || '';
+                            const m = href.match(/(?:selected_item_id|thread_id|item_id)=(\d+)/) || href.match(/\/messages\/(?:e2ee\/)?t\/(\d+)/);
+                            if (m && m[1] && m[1] !== pageId) {
+                                threadId = m[1];
+                                break;
+                            }
+                        }
+                    }
+
+                    // C. Fallback Regex trên thuộc tính hoặc HTML của dòng
+                    if (!threadId) {
+                        const rowHtml = row.outerHTML || '';
+                        const htmlMatch = rowHtml.match(/(?:selected_item_id|thread_id|item_id)=(\d{10,})/) ||
+                            rowHtml.match(/\/messages\/(?:e2ee\/)?t\/(\d{10,})/) ||
+                            rowHtml.match(/"thread_fbid":"(\d{10,})"/) ||
+                            rowHtml.match(/"other_user_id":"(\d{10,})"/);
+                        if (htmlMatch && htmlMatch[1] && htmlMatch[1] !== pageId) {
+                            threadId = htmlMatch[1];
+                        }
+                    }
+
+                    // D. Fallback nếu dòng đang active
+                    if (!threadId && currentSelectedId && (Date.now() - lastThreadSwitchAt >= 1500) && (row.getAttribute('aria-selected') === 'true' || row.getAttribute('aria-current') === 'true')) {
+                        threadId = currentSelectedId;
+                    }
+
+                    if (!threadId || threadId === pageId || seenIds.has(threadId)) continue;
+                    seenIds.add(threadId);
+
+                    // Tên khách hàng: ưu tiên data-crm-contact-name từ injected.js hoặc cachedBizThreadsFromMain
+                    let name = row.getAttribute?.('data-crm-contact-name') ||
+                        row.querySelector?.('[data-crm-contact-name]')?.getAttribute?.('data-crm-contact-name') ||
+                        row.closest?.('[data-crm-contact-name]')?.getAttribute?.('data-crm-contact-name') ||
+                        cachedBizThreadsFromMain.get(String(threadId))?.contactName || '';
+                    if (isInvalidText(name)) name = '';
+
+                    if (!name && threadId === currentSelectedId && currentContactName && !isInvalidText(currentContactName)) {
+                        name = currentContactName;
+                    }
+                    if (!name) {
+                        const nameEl = row.querySelector('[data-surface*="thread_title"], h2, h3, [role="heading"], [dir="auto"], strong, b');
+                        if (nameEl) {
+                            const txt = (nameEl.textContent || '').trim().split('\n')[0].trim();
+                            if (txt && !isInvalidText(txt) && txt.length >= 2 && txt.length <= 80 && !/^\d+$/.test(txt)) {
+                                name = txt;
+                            }
+                        }
+                    }
+                    if (!name) {
+                        const lines = String(row.innerText || '').split(/\n+/).map(s => s.trim()).filter(Boolean);
+                        for (const line of lines) {
+                            if (line && !isInvalidText(line) && line.length >= 2 && line.length <= 80 && !/^\d+$/.test(line) && !/^\d{1,2}:\d{2}$/.test(line)) {
+                                name = line;
+                                break;
+                            }
+                        }
+                    }
+                    if (!name) name = 'Khách hàng';
+
+                    // Avatar
+                    const avatarUrl = extractAvatarFromElement(row);
+
+                    // Last message: dùng innerText của row (bền vững với mọi cấu
+                    // trúc DOM - span 0x0, div lồng nhau) thay vì leaf-node scan
+                    // vốn trả rỗng trên DOM Business Suite mới -> preview bị đè
+                    // thành "Chưa có tin nhắn". Bỏ qua: tên, giờ, thứ/tháng.
+                    let lastMessage = '';
+                    const rowLines = String(row.innerText || '').split(/\n+/).map(s => s.trim()).filter(Boolean);
+                    for (let li = rowLines.length - 1; li >= 0; li--) {
+                        const t = rowLines[li];
+                        if (!t || t === name) continue;
+                        if (/^\d{1,2}:\d{2}$/.test(t)) continue;
+                        if (/^(?:T[2-7]|Thứ\s*\d|Tháng\s*\d+|Hôm qua|Hôm nay|Năm qua)$/i.test(t)) continue;
+                        if (/^\d+\s+Tháng\s*\d+$/i.test(t)) continue;
+                        if (isInvalidText(t)) continue;
+                        lastMessage = t;
+                        break;
+                    }
+
+                    const isOutgoingPreview = /^(?:Bạn:|You:)/i.test(lastMessage.trim());
+                    const hasUnreadIndicator = Boolean(row.querySelector('[aria-label*="chưa đọc" i], [aria-label*="unread" i], [data-testid="unread-count"], [aria-label*="Đánh dấu là chưa đọc" i]'));
+                    const isUnread = !isOutgoingPreview && hasUnreadIndicator;
+
+                    discoveredThreads.push({
+                        id: threadId,
+                        thread_id: threadId,
+                        contact_name: name,
+                        avatar_url: avatarUrl,
+                        last_message: lastMessage || 'Chưa có tin nhắn',
+                        is_unread: isUnread ? 1 : 0,
+                        source_type: 'page_messenger',
+                        page_id: pageId,
+                        inbox_folder: 'INBOX'
+                    });
+                } catch (_) {}
+            }
+
+            // Chẩn đoán discovery: đủ để biết điểm gãy khi khách mới không vào CRM.
+            //   rows=0            -> selector thread_row hết khớp DOM
+            //   rows>0 stamped=0  -> cầu nối MAIN world (injected.js) chưa đóng dấu
+            //   threads=0         -> trích threadId/tên thất bại trên từng dòng
+            let stampedCount = 0;
+            for (const span of bizRowSpans) {
+                if (span.getAttribute('data-crm-thread-id')) stampedCount += 1;
+            }
+            const scanDiag = `rows=${bizRowSpans.length} stamped=${stampedCount} threads=${discoveredThreads.length}`;
+            if (scanDiag !== lastSidebarScanDiag) {
+                lastSidebarScanDiag = scanDiag;
+                if (bizRowSpans.length > 0 && stampedCount === 0) {
+                    console.warn(`[PageContent] ⚠️ Sidebar scan: ${scanDiag} — row chưa được đóng dấu thread-id, kiểm tra cầu nối MAIN world (injected.js)`);
+                } else {
+                    console.log(`[PageContent] 🔎 Sidebar scan: ${scanDiag}`);
+                }
+            }
+
+            if (discoveredThreads.length > 0) {
+                const currentHash = discoveredThreads.map(t => `${t.id}:${t.contact_name}:${t.last_message}:${t.avatar_url || ''}`).join('|');
+                if (force || currentHash !== lastSidebarSyncHash) {
+                    lastSidebarSyncHash = currentHash;
+                    lastSidebarSyncTime = now;
+                    console.log(`[PageContent] 🚀 Tự động cào được ${discoveredThreads.length} hội thoại Page:`, discoveredThreads.map(t => `${t.contact_name} (${t.id})`));
+                    chrome.runtime.sendMessage({
+                        type: 'PAGE_SIDEBAR_THREADS_DISCOVERED',
+                        data: {
+                            page_id: pageId,
+                            threads: discoveredThreads
+                        }
+                    });
+                }
+            }
+            return discoveredThreads;
+        } catch (e) {
+            console.warn('[PageContent] Lỗi scanPageSidebarThreads:', e.message);
+            return [];
+        }
+    }
+
+    // Incoming calls are handled exclusively by content.js.
+} // End isBusiness block

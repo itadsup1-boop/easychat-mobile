@@ -1,0 +1,55 @@
+(function initMessengerTabRoles(root) {
+  const PERSONAL_ROLES = ['chat', 'campaign', 'interaction', 'discovery', 'history', 'requests', 'request_action'];
+
+  function roleKey(accountId, role) {
+    if (!PERSONAL_ROLES.includes(role)) throw new Error(`Unknown Messenger tab role: ${role}`);
+    return `personal:${String(accountId)}:${role}`;
+  }
+
+  function legacyInteractionKey(accountId) {
+    return `personal:${String(accountId)}`;
+  }
+
+  function roleForTab(registryEntries, accountId, tabId) {
+    const targetId = String(tabId);
+    const entries = Array.isArray(registryEntries) ? registryEntries : [];
+    for (const [key, value] of entries) {
+      if (String(value) !== targetId) continue;
+      if (key === roleKey(accountId, 'campaign')) return 'campaign';
+      if (key === roleKey(accountId, 'history')) return 'history';
+      if (key === roleKey(accountId, 'requests')) return 'requests';
+      if (key === roleKey(accountId, 'request_action')) return 'request_action';
+      if (key === roleKey(accountId, 'discovery')) return 'discovery';
+      if (key === roleKey(accountId, 'chat') || key === legacyInteractionKey(accountId) || key === roleKey(accountId, 'interaction')) return 'chat';
+    }
+    return null;
+  }
+
+  function canForwardRealtime(role) {
+    // Allow chat, interaction, discovery, and stationary history tabs to forward
+    // live messages (actively scrolling history tabs use 'history_scrolling').
+    return role === 'chat' || role === 'interaction' || role === 'discovery' || role === 'history';
+  }
+
+  function canForwardIncomingRealtime(role) {
+    return canForwardRealtime(role);
+  }
+
+  function canForwardCallRealtime(role) {
+    return role === 'chat' || role === 'interaction' || role === 'discovery';
+  }
+
+  // 2026-09-30: scheduler retry nối suffix "_extension_replay"/"_replay" vào
+  // reason khi dispatch lần đầu fail (SW ngủ/churn). Phép so sánh
+  // allowedReasons phía handleSyncThreadMessages phải tách SẠCH suffix này
+  // trước khi tra bảng - thiếu bước này khiến mọi item replay fail tức thì
+  // navigation_not_authorized và hàng đợi sweep churn không sync được gì
+  // (reproduce 2026-09-30: initial_sweep_extension_replay fail hàng loạt).
+  function stripSyncReasonSuffix(reason) {
+    return String(reason || '').replace(/(?:_extension)?(?:_replay)+$/g, '');
+  }
+
+  const api = { PERSONAL_ROLES, roleKey, legacyInteractionKey, roleForTab, canForwardRealtime, canForwardIncomingRealtime, canForwardCallRealtime, stripSyncReasonSuffix };
+  root.FbCrmMessengerTabRoles = api;
+  if (typeof module === 'object' && module.exports) module.exports = api;
+})(typeof globalThis !== 'undefined' ? globalThis : this);

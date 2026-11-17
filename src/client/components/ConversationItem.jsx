@@ -1,0 +1,342 @@
+import React, { useState } from 'react';
+import { BellRing, BellOff, Clock3, Archive, Check, Mail, MailOpen, Pin, PinOff, X } from 'lucide-react';
+import { getStatusBadgeStyle } from '../utils/color.js';
+import { getReminderDueAriaLabel, getReminderDueState, reminderBellKey } from '../utils/reminderPresentation.js';
+import { isThreadActiveToday, normalizeThreadTimestamp } from '../utils/threadActivity.js';
+
+const AVATAR_COLORS = ['#2684ff', '#a855f7', '#0fbd74', '#ec4899', '#ff6b2c', '#00b8a9', '#6366f1', '#ff3b4f', '#f5b51b', '#06b6d4'];
+
+function pickAvatarColor(id) {
+  const text = String(id || '0');
+  const total = [...text].reduce((sum, char) => sum + char.charCodeAt(0), 0);
+  return AVATAR_COLORS[total % AVATAR_COLORS.length];
+}
+
+function formatTime(value) {
+  if (!value) return '';
+  const parsed = new Date(normalizeThreadTimestamp(value));
+  if (Number.isNaN(parsed.getTime())) return String(value);
+  return parsed.toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit' });
+}
+
+function ConversationItem({ thread, isSelected, onSelect, accounts = [], inboxSources = [], selectionMode = false, isChecked = false, onToggle, onToggleUnread, onTogglePin, reminderBellMuted, onToggleReminderBell, onCompleteReminder, onCancelReminder }) {
+  const account = accounts.find((item) => String(item.id) === String(thread.account_id));
+  const source = inboxSources.find((item) => String(item.id) === String(thread.source_id));
+  const isOnline = account ? account.is_extension_connected !== false : true;
+  const isManuallyRead = Number(thread.unread_manual) === -1;
+  const unreadCount = isManuallyRead || !Number(thread.is_unread)
+    ? 0
+    : Number(thread.unread_count || 1);
+  // Cờ is_unread là ảnh chấm xanh FB — FB không tự tắt khi CRM trả lời bằng
+  // API nên sync cứ hâm lại trên hội thoại cũ (14/10). Badge/dot/bold chỉ
+  // tính với hội thoại hoạt động HÔM NAY; trạng thái đánh tay (isThreadUnreadRow)
+  // giữ nguyên không gate (2026-10-21).
+  const unreadVisible = !isManuallyRead && unreadCount > 0 && (isThreadActiveToday(thread) || Number(thread.unread_manual) === 1);
+  const isThreadUnreadRow = unreadVisible;
+  const isPinned = Number(thread.pinned) === 1;
+  const [ctxMenu, setCtxMenu] = useState(null);
+  const [bellMenu, setBellMenu] = useState(null);
+  const handleContextMenu = (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setBellMenu(null);
+    setCtxMenu({ x: Math.min(event.clientX, window.innerWidth - 190), y: Math.min(event.clientY, window.innerHeight - 90) });
+  };
+  // Bấm chuông đỏ = mở menu (tắt chuông / hoàn thành / hủy nhắc) thay vì tắt
+  // miệng — tránh bấm nhầm hành động mất ghi chú trên icon nhỏ.
+  const handleOpenBellMenu = (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setCtxMenu(null);
+    const rect = event.currentTarget.getBoundingClientRect();
+    setBellMenu({
+      x: Math.min(rect.right + 8, window.innerWidth - 190),
+      y: Math.min(rect.top, window.innerHeight - 130)
+    });
+  };
+  const handleBellMenuAction = (action) => (event) => {
+    event.stopPropagation();
+    event.preventDefault();
+    setBellMenu(null);
+    if (action === 'mute') { onToggleReminderBell?.(thread); return; }
+    if (action === 'complete') { Promise.resolve(onCompleteReminder?.(thread.id)).catch(() => {}); return; }
+    if (action === 'cancel') Promise.resolve(onCancelReminder?.(thread.id)).catch(() => {});
+  };
+  const handlePinFromMenu = (event) => {
+    event.stopPropagation();
+    event.preventDefault();
+    setCtxMenu(null);
+    if (onTogglePin) onTogglePin(thread, !isPinned);
+  };
+  // Icon ghim trên dòng ghim bấm được = bỏ ghim luôn (không cần chuột phải).
+  const handleUnpinBadge = (event) => {
+    if (!onTogglePin || !isPinned) return;
+    event.stopPropagation();
+    event.preventDefault();
+    onTogglePin(thread, false);
+  };
+  const handleToggleUnread = (event) => {
+    if (!onToggleUnread) return;
+    event.stopPropagation();
+    event.preventDefault();
+    onToggleUnread(thread, !isThreadUnreadRow);
+  };
+  const avatarColor = pickAvatarColor(thread.id || thread.nickname || thread.contact_name);
+  const title = thread.nickname || thread.contact_name || thread.name || 'Khách hàng';
+  const preview = thread.last_message || 'Chưa có tin nhắn';
+  const showAccountName = accounts.length > 1;
+  const accountName = account ? (account.name || account.id) : (thread.account_id || 'Facebook');
+  const sourceType = thread.source_type || source?.source_type || 'personal_messenger';
+  const sourceName = thread.source_name || source?.display_name || accountName;
+  const sourceLabel = sourceType === 'page_messenger' ? 'Gửi bằng Page: ' + sourceName : 'Gửi bằng: ' + accountName;
+  const accountColor = pickAvatarColor(thread.account_id || thread.source_id || sourceName);
+  const senderAccountId = sourceType === 'page_messenger' ? (source?.external_id || thread.source_external_id || thread.source_id) : thread.account_id;
+  const senderAccountSuffix = String(senderAccountId || '').slice(-4);
+  const senderAccountAvatarUrl = sourceType === 'page_messenger' ? source?.avatar_url : (account?.avatar_url || source?.avatar_url);
+  const sourceClass = sourceType === 'page_messenger'
+    ? 'bg-violet-500/10 text-violet-500 border border-violet-500/20'
+    : 'bg-sky-500/10 text-sky-500 border border-sky-500/20';
+  const statusMap = {
+    UNPROCESSED: { label: 'Chưa xử lý', className: 'bg-[var(--color-warning-subtle)] text-[var(--color-warning)]' },
+    ASSIGNED: { label: 'Đang xử lý', className: 'bg-[var(--color-accent-subtle)] text-[var(--color-accent)]' },
+    COMPLETED: { label: 'Đã chốt', className: 'bg-[var(--color-success-subtle)] text-[var(--color-success)]' }
+  };
+  const status = statusMap[thread.status] || statusMap.UNPROCESSED;
+  const reminderState = getReminderDueState(thread);
+  const isReminderDue = reminderState.isDue;
+  const reminderAriaLabel = getReminderDueAriaLabel(thread);
+  const isSelectedState = selectionMode ? isChecked : isSelected;
+  const rowClassName = [
+    'w-full flex items-center gap-3 px-3 py-3 min-h-[82px] cursor-pointer text-left transition-colors border-b border-[var(--color-border)]',
+    isSelectedState
+      ? (isReminderDue
+        ? 'bg-[var(--color-accent-subtle)] border-l-4 border-l-[var(--color-danger)] pl-2 shadow-[inset_0_0_0_1px_rgba(239,68,68,0.28)]'
+        : 'bg-[var(--color-accent-subtle)] border-l-4 border-l-[var(--color-accent)] pl-2')
+      : (isReminderDue
+        ? 'border-l-4 border-l-[var(--color-danger)] bg-[var(--color-danger-subtle)] shadow-[inset_0_0_0_1px_rgba(239,68,68,0.18)] hover:brightness-[0.98]'
+        : (unreadVisible
+          ? 'border-l-4 border-l-[var(--color-accent)] bg-[var(--color-accent-subtle)]/30 hover:bg-[var(--color-accent-subtle)]/60'
+          : 'border-l-4 border-l-transparent hover:bg-[var(--color-bg-hover)]'))
+  ].join(' ');
+
+  return (
+    <button
+      type="button"
+      onClick={() => (selectionMode ? onToggle?.(thread.id) : onSelect?.(thread.id))}
+      onContextMenu={handleContextMenu}
+      aria-pressed={selectionMode ? isChecked : undefined}
+      aria-label={isReminderDue ? title + '. ' + reminderAriaLabel : title}
+      className={rowClassName}
+    >
+      {selectionMode && (
+        <span aria-hidden="true" className={'flex h-5 w-5 shrink-0 items-center justify-center rounded-md border text-[11px] font-bold ' + (isChecked ? 'border-[var(--color-accent)] bg-[var(--color-accent)] text-white' : 'border-[var(--color-border-strong)] bg-[var(--color-bg-surface)]')}>
+          {isChecked ? '✓' : ''}
+        </span>
+      )}
+      <div className="relative flex-shrink-0">
+        {thread.avatar_url ? (
+          <img src={String(thread.avatar_url).startsWith('http') ? thread.avatar_url : '/api/avatars/' + thread.avatar_url} alt="" className="w-11 h-11 rounded-full object-cover border border-[var(--color-border)] shadow-sm" />
+        ) : (
+          <div className="w-11 h-11 rounded-full flex items-center justify-center text-[var(--color-text-on-accent)] font-semibold text-sm shadow-sm" style={{ backgroundColor: avatarColor }}>
+            {title.charAt(0).toUpperCase()}
+          </div>
+        )}
+        {isReminderDue && (() => {
+          const bellMuted = reminderBellMuted?.has(reminderBellKey(thread)) ?? false;
+          return (
+            <span
+              role="button"
+              tabIndex={-1}
+              aria-label="Tuỳ chọn lời nhắc"
+              title="Chuông lời nhắc — bấm để tắt chuông, hoàn thành hoặc hủy nhắc"
+              onClick={handleOpenBellMenu}
+              className={
+                'absolute -left-1.5 -top-1.5 inline-flex h-6 w-6 items-center justify-center rounded-full border-2 border-[var(--color-bg-panel)] bg-[var(--color-danger)] text-[var(--color-text-on-accent)] shadow-sm cursor-pointer '
+                + (bellMuted ? 'opacity-55' : 'reminder-due-pulse')
+              }
+            >
+              <BellRing size={12} strokeWidth={2.4} />
+            </span>
+          );
+        })()}
+        {unreadVisible && !isReminderDue && (
+          <span className="absolute -left-1 -top-1 flex h-4 w-4" title="Tin nhắn mới">
+            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[var(--color-accent)] opacity-75"></span>
+            <span className="relative inline-flex rounded-full h-4 w-4 bg-[var(--color-accent)] border-2 border-[var(--color-bg-panel)]"></span>
+          </span>
+        )}
+        {sourceType === 'page_messenger' ? (
+          // Thread PAGE: thay chấm online (vô nghĩa với page) bằng badge avatar page
+          senderAccountAvatarUrl ? (
+            <img
+              src={senderAccountAvatarUrl}
+              alt=""
+              title={sourceName}
+              className="absolute -bottom-1.5 -right-1.5 h-[18px] w-[18px] rounded-full object-cover border-2 border-[var(--color-bg-panel)] shadow-sm"
+              onError={(e) => { e.currentTarget.style.display = 'none'; }}
+            />
+          ) : (
+            <span
+              title={sourceName}
+              className="absolute -bottom-1.5 -right-1.5 flex h-[18px] w-[18px] items-center justify-center rounded-full border-2 border-[var(--color-bg-panel)] bg-violet-500 text-[9px] font-bold text-white shadow-sm"
+            >
+              {(sourceName || 'P').charAt(0).toUpperCase()}
+            </span>
+          )
+        ) : (
+          <span className={'absolute bottom-0 right-0 w-3 h-3 rounded-full border-2 border-[var(--color-bg-panel)] ' + (isOnline ? 'bg-[var(--color-success)]' : 'bg-[var(--color-text-muted)]')} />
+        )}
+      </div>
+
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center justify-between gap-2 mb-0.5">
+          <span className={'text-sm truncate ' + (unreadVisible ? 'font-bold' : 'font-semibold') + ' text-[var(--color-text-primary)]'}>{title}</span>
+          <span className="flex items-center gap-1 flex-shrink-0">
+            {isPinned && (
+              <span
+                role="button"
+                tabIndex={0}
+                onClick={handleUnpinBadge}
+                onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') handleUnpinBadge(event); }}
+                title="Bấm để bỏ ghim"
+                aria-label="Bấm để bỏ ghim hội thoại"
+                className="text-[var(--color-accent)] cursor-pointer rounded-sm hover:text-[var(--color-danger)] hover:bg-[var(--color-bg-hover)] transition-colors"
+              >
+                <Pin size={11} strokeWidth={2.4} className="rotate-45" />
+              </span>
+            )}
+            <span className="text-xs text-[var(--color-text-muted)] font-mono">{formatTime(thread.last_msg_ts || thread.last_activity)}</span>
+          </span>
+        </div>
+        <p className={'text-xs truncate mb-1.5 ' + (unreadVisible ? 'text-[var(--color-text-primary)] font-semibold' : 'text-[var(--color-text-muted)]')}>{preview}</p>
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex flex-wrap items-center gap-1.5 min-w-0">
+            {(thread.status !== 'UNPROCESSED' || isThreadActiveToday(thread)) && (
+              <span className={'text-xs px-2 py-0.5 rounded-full font-medium ' + status.className}>{status.label}</span>
+            )}
+            {isReminderDue && (
+              <span className="inline-flex items-center gap-1.5 rounded-full border border-[var(--color-danger)]/30 bg-[var(--color-danger)] px-2 py-1 text-[10px] font-extrabold uppercase tracking-[0.04em] text-[var(--color-text-on-accent)] shadow-sm" title={reminderAriaLabel}>
+                <Clock3 size={12} strokeWidth={2.4} /> Cần nhắc <span className="rounded bg-white/20 px-1 py-px normal-case tracking-normal">{reminderState.label}</span>
+              </span>
+            )}
+            {thread.archived_at && (<span className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full font-medium bg-[var(--color-bg-surface)] text-[var(--color-text-muted)]" title="Đã lưu trữ"><Archive size={11} /> Lưu</span>)}
+            {thread.status_name && (<span className="text-xs px-2 py-0.5 rounded-full font-medium truncate max-w-[100px]" style={getStatusBadgeStyle(thread.status_color)} title={thread.status_name}>{thread.status_name}</span>)}
+            {(showAccountName || thread.source_id) && (
+              <span className={'inline-flex max-w-[210px] items-center gap-1.5 truncate rounded-full px-2 py-0.5 text-[11px] font-bold ' + sourceClass} title={`${sourceLabel} · ID ${thread.account_id || source?.external_id || ''}`}>
+                <span className="relative flex h-5 w-5 shrink-0 items-center justify-center overflow-hidden rounded-full text-[9px] font-extrabold text-white" style={{ backgroundColor: accountColor }}>
+                  {String(sourceName || accountName || 'F').charAt(0).toUpperCase()}
+                  {senderAccountAvatarUrl && <img src={senderAccountAvatarUrl} alt="" className="absolute inset-0 h-full w-full object-cover" onError={(event) => { event.currentTarget.style.display = 'none'; }} />}
+                </span>
+                <span className="truncate">{sourceLabel}</span>
+                {senderAccountSuffix && <span className="shrink-0 font-mono text-[9px] opacity-75">#{senderAccountSuffix}</span>}
+              </span>
+            )}
+          </div>
+          <span className="flex items-center gap-1.5 shrink-0">
+            {unreadVisible && (
+              <span className="bg-[var(--color-accent)] text-[var(--color-text-on-accent)] text-xs rounded-full min-w-5 h-5 px-1.5 flex items-center justify-center font-bold shadow-sm animate-pulse">
+                {unreadCount}
+              </span>
+            )}
+            {!selectionMode && onToggleUnread && (
+              <span
+                role="button"
+                tabIndex={0}
+                onClick={handleToggleUnread}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' || event.key === ' ') handleToggleUnread(event);
+                }}
+                title={isThreadUnreadRow ? 'Đánh dấu đã đọc' : 'Đánh dấu chưa đọc'}
+                aria-label={isThreadUnreadRow ? 'Đánh dấu đã đọc' : 'Đánh dấu chưa đọc'}
+                className={'w-6 h-6 rounded-md inline-flex items-center justify-center transition-colors cursor-pointer ' + (isThreadUnreadRow
+                  ? 'text-[var(--color-accent)] bg-[var(--color-accent-subtle)] hover:brightness-110'
+                  : 'text-[var(--color-text-muted)] hover:text-[var(--color-accent)] hover:bg-[var(--color-bg-hover)]')}
+              >
+                {isThreadUnreadRow ? <MailOpen size={13} strokeWidth={2.2} /> : <Mail size={13} strokeWidth={2.2} />}
+              </span>
+            )}
+          </span>
+        </div>
+      </div>
+
+      {bellMenu && (() => {
+        const bellMuted = reminderBellMuted?.has(reminderBellKey(thread)) ?? false;
+        return (
+          <React.Fragment>
+            <span
+              aria-hidden="true"
+              className="fixed inset-0"
+              style={{ zIndex: 9998 }}
+              onMouseDown={() => setBellMenu(null)}
+              onContextMenu={(event) => { event.preventDefault(); setBellMenu(null); }}
+            />
+            <span
+              role="menu"
+              aria-label="Tuỳ chọn lời nhắc"
+              className="fixed w-44 py-1 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-elevated)] shadow-lg"
+              style={{ left: bellMenu.x, top: bellMenu.y, zIndex: 9999 }}
+              onMouseDown={(event) => event.stopPropagation()}
+            >
+              <button
+                type="button"
+                role="menuitem"
+                onClick={handleBellMenuAction('mute')}
+                className="w-full flex items-center gap-2 px-3 py-2 text-xs font-semibold text-left text-[var(--color-text-primary)] hover:bg-[var(--color-bg-hover)] cursor-pointer"
+              >
+                {bellMuted ? <BellRing size={13} strokeWidth={2.2} /> : <BellOff size={13} strokeWidth={2.2} />}
+                {bellMuted ? 'Bật lại chuông' : 'Tắt chuông'}
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                onClick={handleBellMenuAction('complete')}
+                className="w-full flex items-center gap-2 px-3 py-2 text-xs font-semibold text-left text-[var(--color-success)] hover:bg-[var(--color-bg-hover)] cursor-pointer"
+              >
+                <Check size={13} strokeWidth={2.4} /> Hoàn thành
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                onClick={handleBellMenuAction('cancel')}
+                className="w-full flex items-center gap-2 px-3 py-2 text-xs font-semibold text-left text-[var(--color-danger)] hover:bg-[var(--color-bg-hover)] cursor-pointer"
+              >
+                <X size={13} strokeWidth={2.4} /> Hủy nhắc
+              </button>
+            </span>
+          </React.Fragment>
+        );
+      })()}
+
+      {ctxMenu && (
+        <React.Fragment>
+          <span
+            aria-hidden="true"
+            className="fixed inset-0"
+            style={{ zIndex: 9998 }}
+            onMouseDown={() => setCtxMenu(null)}
+            onContextMenu={(event) => { event.preventDefault(); setCtxMenu(null); }}
+          />
+          <span
+            role="menu"
+            aria-label="Menu hội thoại"
+            className="fixed w-44 py-1 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-elevated)] shadow-lg"
+            style={{ left: ctxMenu.x, top: ctxMenu.y, zIndex: 9999 }}
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <button
+              type="button"
+              role="menuitem"
+              onClick={handlePinFromMenu}
+              className="w-full flex items-center gap-2 px-3 py-2 text-xs font-semibold text-left text-[var(--color-text-primary)] hover:bg-[var(--color-bg-hover)] cursor-pointer"
+            >
+              {isPinned ? <PinOff size={13} strokeWidth={2.2} /> : <Pin size={13} strokeWidth={2.2} className="rotate-45" />}
+              {isPinned ? 'Bỏ ghim hội thoại' : 'Ghim hội thoại'}
+            </button>
+          </span>
+        </React.Fragment>
+      )}
+    </button>
+  );
+}
+
+export default React.memo(ConversationItem);
