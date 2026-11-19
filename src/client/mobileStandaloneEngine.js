@@ -204,33 +204,33 @@ export async function syncFromDesktopToMobile(nativeFetch = window._easychatNati
     store.autoReplyRules = snapshot.autoReplyRules;
   }
   if (snapshot.contactsByThread && typeof snapshot.contactsByThread === 'object') {
-    store.contactsByThread = { ...store.contactsByThread, ...snapshot.contactsByThread };
+    store.contactsByThread = { ...snapshot.contactsByThread };
   }
   if (snapshot.messagesByThread && typeof snapshot.messagesByThread === 'object') {
+    const nextMessages = {};
     for (const [tid, msgs] of Object.entries(snapshot.messagesByThread)) {
       if (!Array.isArray(msgs)) continue;
-      const existing = store.messagesByThread[tid] || [];
       const byId = new Map();
-      for (const m of existing) byId.set(String(m.fb_message_id || m.id), m);
       for (const m of msgs) byId.set(String(m.fb_message_id || m.id), m);
-      const combined = Array.from(byId.values()).sort((a, b) => (Number(a.timestamp_ms) || 0) - (Number(b.timestamp_ms) || 0));
-      store.messagesByThread[tid] = combined;
+      nextMessages[tid] = Array.from(byId.values()).sort((a, b) => (Number(a.timestamp_ms) || 0) - (Number(b.timestamp_ms) || 0));
     }
+    store.messagesByThread = nextMessages;
   }
   if (Array.isArray(snapshot.threads)) {
-    const byTid = new Map();
-    for (const t of store.threads) byTid.set(String(t.id), t);
+    const nextThreads = [];
+    const seen = new Set();
     for (const t of snapshot.threads) {
       const tid = String(t.id);
+      if (seen.has(tid)) continue;
+      seen.add(tid);
       const msgs = store.messagesByThread[tid] || [];
       const lastMsgTs = msgs.length ? Number(msgs[msgs.length - 1]?.timestamp_ms || 0) : (Date.parse(t.last_activity || '') || Date.now());
-      byTid.set(tid, {
-        ...(byTid.get(tid) || {}),
+      nextThreads.push({
         ...t,
         last_msg_ts: lastMsgTs
       });
     }
-    store.threads = Array.from(byTid.values());
+    store.threads = nextThreads;
   }
 
   saveStore();
