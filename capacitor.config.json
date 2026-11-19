@@ -4,7 +4,7 @@
   "webDir": "dist/client",
   "bundledWebRuntime": false,
   "server": {
-    "androidScheme": "https",
+    "androidScheme": "http",
     "cleartext": true
   }
 }

@@ -20,7 +20,7 @@ const ConversationThreadList = React.memo(function ConversationThreadList({
   threads, resetKey, activeThreadId, onSelectThread, accounts, inboxSources,
   campaignSelectionMode, selectedCampaignThreadIds, onToggleCampaignThread,
   onToggleUnread, onTogglePin, reminderBellMuted, onToggleReminderBell,
-  onCompleteReminder, onCancelReminder
+  onCompleteReminder, onCancelReminder, onSyncFromDesktop, desktopSyncing, desktopSyncNotice
 }) {
   const [renderedThreadCount, setRenderedThreadCount] = useState(THREAD_RENDER_BATCH_SIZE);
   const threadListRef = useRef(null);
@@ -39,7 +39,25 @@ const ConversationThreadList = React.memo(function ConversationThreadList({
   };
 
   if (threads.length === 0) {
-    return <div className="flex-1 min-h-0 overflow-y-auto"><EmptyState title="Không tìm thấy hội thoại" description="Thử đổi bộ lọc hoặc từ khóa tìm kiếm." /></div>;
+    return (
+      <div className="flex-1 min-h-0 overflow-y-auto flex flex-col items-center justify-center p-6 text-center gap-3">
+        <EmptyState title="Chưa có hội thoại" description="Bấm nút Đồng bộ từ PC bên dưới để kéo toàn bộ Fanpage, Token và tin nhắn từ App Desktop về điện thoại." />
+        {onSyncFromDesktop && (
+          <button
+            type="button"
+            onClick={onSyncFromDesktop}
+            disabled={desktopSyncing}
+            className="px-4 py-2.5 rounded-xl bg-[var(--color-accent)] hover:bg-[var(--color-accent-hover)] text-white text-sm font-bold flex items-center gap-2 shadow-md disabled:opacity-60 cursor-pointer"
+          >
+            <RefreshCw size={16} className={desktopSyncing ? 'animate-spin' : ''} />
+            <span>{desktopSyncing ? 'Đang đồng bộ từ PC...' : 'Đồng bộ dữ liệu từ PC'}</span>
+          </button>
+        )}
+        {desktopSyncNotice && (
+          <div className="text-xs font-medium text-[var(--color-text-secondary)] max-w-xs">{desktopSyncNotice}</div>
+        )}
+      </div>
+    );
   }
 
   return (
@@ -90,7 +108,29 @@ export default function ConversationSidebar({
   const [appliedFilters, setAppliedFilters] = useState(() => normalizeFilters(createDefaultFilters()));
   const [isFilterPopoverOpen, setIsFilterPopoverOpen] = useState(false);
   const [isSyncMenuOpen, setIsSyncMenuOpen] = useState(false);
+  const [desktopSyncing, setDesktopSyncing] = useState(false);
+  const [desktopSyncNotice, setDesktopSyncNotice] = useState('');
   const filterButtonRef = useRef(null);
+
+  const handleManualDesktopSync = async () => {
+    if (desktopSyncing) return;
+    setDesktopSyncing(true);
+    setDesktopSyncNotice('Đang kết nối tới App Desktop...');
+    try {
+      onToggleSidebarSync?.();
+      const res = await fetch('/api/mobile-sync/from-desktop', { method: 'POST' });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data?.success) {
+        setDesktopSyncNotice(`✅ Đã đồng bộ ${data.threads_count || 0} hội thoại & ${data.pages_count || 0} Fanpage ${data.source_label || 'từ PC'}!`);
+      } else {
+        setDesktopSyncNotice(`⚠️ ${data?.message || 'Chưa lấy được dữ liệu từ PC. Hãy đảm bảo App Desktop đang mở.'}`);
+      }
+    } catch (err) {
+      setDesktopSyncNotice(`⚠️ Lỗi đồng bộ: ${err.message}`);
+    } finally {
+      setDesktopSyncing(false);
+    }
+  };
 
   const activeFilterCount = countActiveFilters(appliedFilters);
   const hasFilterActive = activeFilterCount > 0;
@@ -178,21 +218,15 @@ export default function ConversationSidebar({
             <div className="relative">
               <button
                 type="button"
-                onClick={() => { setIsSyncMenuOpen(false); onToggleSidebarSync?.(); }}
-                disabled={!isConnected}
-                className={`relative p-1.5 rounded-full transition-colors cursor-pointer disabled:cursor-not-allowed disabled:opacity-40 ${sidebarSyncActive ? 'bg-[var(--color-accent-subtle)] text-[var(--color-accent)]' : 'hover:bg-[var(--color-bg-hover)]'}`}
-                title={sidebarSyncActive
-                  ? `\u0110ang \u0111\u1ed3ng b\u1ed9 H\u1ed9i tho\u1ea1i + Tin nh\u1eafn ch\u1edd + Page (c\u00f2n ${sidebarSyncSecondsRemaining}s). B\u1ea5m \u0111\u1ec3 t\u1eaft.`
-                  : 'B\u1eadt \u0111\u1ed3ng b\u1ed9 H\u1ed9i tho\u1ea1i + Tin nh\u1eafn ch\u1edd + Page trong 2 ph\u00fat'}
-                aria-label={sidebarSyncActive ? 'T\u1eaft \u0111\u1ed3ng b\u1ed9 H\u1ed9i tho\u1ea1i, Tin nh\u1eafn ch\u1edd v\u00e0 Page' : 'B\u1eadt \u0111\u1ed3ng b\u1ed9 H\u1ed9i tho\u1ea1i, Tin nh\u1eafn ch\u1edd v\u00e0 Page trong 2 ph\u00fat'}
+                onClick={() => { setIsSyncMenuOpen(false); handleManualDesktopSync(); }}
+                disabled={!isConnected || desktopSyncing}
+                className={`relative px-2.5 py-1.5 rounded-full transition-colors cursor-pointer disabled:cursor-not-allowed disabled:opacity-40 flex items-center gap-1 text-xs font-bold ${sidebarSyncActive || desktopSyncing ? 'bg-[var(--color-accent)] text-white' : 'bg-[var(--color-accent-subtle)] text-[var(--color-accent)] hover:bg-[var(--color-accent)] hover:text-white'}`}
+                title="Đồng bộ toàn bộ dữ liệu từ App Desktop PC sang điện thoại"
+                aria-label="Đồng bộ từ PC"
                 aria-pressed={sidebarSyncActive}
               >
-                <RefreshCw size={17} className={sidebarSyncActive ? 'animate-spin text-[var(--color-accent)]' : 'text-[var(--color-text-muted)]'} strokeWidth={1.75} />
-                {sidebarSyncActive && (
-                  <span className="absolute -right-2 -bottom-2 min-w-[22px] h-4 px-1 rounded-full bg-[var(--color-accent)] text-[var(--color-text-on-accent)] text-[8px] font-bold flex items-center justify-center shadow-sm">
-                    {sidebarSyncSecondsRemaining}s
-                  </span>
-                )}
+                <RefreshCw size={14} className={sidebarSyncActive || desktopSyncing ? 'animate-spin' : ''} strokeWidth={2} />
+                <span>{desktopSyncing ? 'Đang đồng bộ...' : 'Đồng bộ PC'}</span>
               </button>
               {isSyncMenuOpen && (
                 <div role="menu" className="absolute right-0 top-9 z-50 w-40 rounded-xl border border-[var(--color-border)] bg-[var(--color-bg-panel)] p-1.5 shadow-xl">
@@ -293,6 +327,9 @@ export default function ConversationSidebar({
         onToggleReminderBell={onToggleReminderBell}
         onCompleteReminder={onCompleteReminder}
         onCancelReminder={onCancelReminder}
+        onSyncFromDesktop={handleManualDesktopSync}
+        desktopSyncing={desktopSyncing}
+        desktopSyncNotice={desktopSyncNotice}
       />
       {campaignSelectionMode && (
         <div className="flex shrink-0 items-center gap-2 border-t border-[var(--color-border)] bg-[var(--color-bg-elevated)] p-3">

@@ -132,9 +132,9 @@ export async function syncFromDesktopToMobile(nativeFetch = window._easychatNati
     }
   }
 
-  // Layer 3: Direct LAN IP fallback if on the same Wi-Fi network as PC
+  // Layer 3: Direct LAN IP fallback if on the same Wi-Fi network or Android Emulator (LDPlayer) as PC
   if (!snapshot) {
-    const lanCandidates = ['192.168.1.182', ...(store.desktopLanIps || [])];
+    const lanCandidates = ['192.168.1.182', '10.0.2.2', ...(store.desktopLanIps || [])];
     for (const ip of [...new Set(lanCandidates)]) {
       try {
         const ctrl = new AbortController();
