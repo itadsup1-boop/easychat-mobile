@@ -20,6 +20,8 @@ function loadStore() {
       const parsed = JSON.parse(raw);
       return {
         inboxSources: Array.isArray(parsed.inboxSources) ? parsed.inboxSources : [],
+        accounts: Array.isArray(parsed.accounts) ? parsed.accounts : [],
+        desktopLanIps: Array.isArray(parsed.desktopLanIps) ? parsed.desktopLanIps : [],
         threads: Array.isArray(parsed.threads) ? parsed.threads : [],
         messagesByThread: parsed.messagesByThread && typeof parsed.messagesByThread === 'object' ? parsed.messagesByThread : {},
         contactsByThread: parsed.contactsByThread && typeof parsed.contactsByThread === 'object' ? parsed.contactsByThread : {},
@@ -36,6 +38,7 @@ function loadStore() {
   } catch (_) {}
   return {
     inboxSources: [],
+    accounts: [],
     threads: [],
     messagesByThread: {},
     contactsByThread: {},
@@ -52,6 +55,204 @@ function loadStore() {
 
 let store = loadStore();
 const stagedFiles = new Map(); // attachment_id -> { id, file, preview_url, media_type, name, size, mime_type }
+
+async function sha256Bytes(inputStr) {
+  const data = new TextEncoder().encode(String(inputStr || ''));
+  const hashBuf = await window.crypto.subtle.digest('SHA-256', data);
+  return new Uint8Array(hashBuf);
+}
+
+async function sha256Hex(inputStr) {
+  const bytes = await sha256Bytes(inputStr);
+  return Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function xorDecipherBase64(cipherB64, secret) {
+  if (!cipherB64) return '';
+  try {
+    const binStr = atob(String(cipherB64));
+    const keyBytes = await sha256Bytes(String(secret || 'easychat'));
+    const out = new Uint8Array(binStr.length);
+    for (let i = 0; i < binStr.length; i++) {
+      out[i] = (binStr.charCodeAt(i) & 0xff) ^ keyBytes[i % keyBytes.length];
+    }
+    return new TextDecoder().decode(out);
+  } catch (_) {
+    return '';
+  }
+}
+
+export async function syncFromDesktopToMobile(nativeFetch = window._easychatNativeFetch || window.fetch) {
+  const user = getSavedUser();
+  const username = String(user?.username || user?.email || '').trim().toLowerCase();
+  const licenseKey = String(getStoredLicenseKey() || '').trim();
+  if (!username) {
+    throw new Error('Vui lòng đăng nhập tài khoản trước khi đồng bộ.');
+  }
+
+  let snapshot = null;
+  let sourceLabel = '';
+
+  // Layer 1: Cloud Sync via Central License Server (license_server1)
+  try {
+    const resp = await nativeFetch(`${LICENSE_SERVER_BASE}/api/cloud-sync/request`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, licenseKey })
+    });
+    if (resp.ok) {
+      const data = await resp.json().catch(() => ({}));
+      if (data?.success && data?.snapshot) {
+        snapshot = data.snapshot;
+        sourceLabel = data.live_from_desktop ? 'trực tiếp từ PC qua Cloud' : 'từ bản sao Cloud của PC';
+      }
+    }
+  } catch (_) {}
+
+  // Layer 2: Cloud Snapshot Branch (mobile-sync-data on GitHub)
+  if (!snapshot) {
+    const syncHash = (await sha256Hex(`${username}|${licenseKey.toUpperCase()}`)).slice(0, 24);
+    const userHash = (await sha256Hex(`easychat_user|${username}`)).slice(0, 24);
+    const candidateUrls = [
+      `https://raw.githubusercontent.com/itadsup1-boop/CRM_FB_Mobile/mobile-sync-data/snapshots/${syncHash}.json?t=${Date.now()}`,
+      `https://raw.githubusercontent.com/itadsup1-boop/CRM_FB_Mobile/mobile-sync-data/snapshots/user_${userHash}.json?t=${Date.now()}`
+    ];
+    for (const ghUrl of candidateUrls) {
+      try {
+        const resp = await nativeFetch(ghUrl);
+        if (resp.ok) {
+          const parsed = await resp.json().catch(() => null);
+          if (parsed && Array.isArray(parsed.threads)) {
+            snapshot = parsed;
+            sourceLabel = 'từ Cloud Sync của App Desktop';
+            break;
+          }
+        }
+      } catch (_) {}
+    }
+  }
+
+  // Layer 3: Direct LAN IP fallback if on the same Wi-Fi network as PC
+  if (!snapshot) {
+    const lanCandidates = ['192.168.1.182', ...(store.desktopLanIps || [])];
+    for (const ip of [...new Set(lanCandidates)]) {
+      try {
+        const ctrl = new AbortController();
+        const t = setTimeout(() => ctrl.abort(), 2500);
+        const resp = await nativeFetch(
+          `http://${ip}:5050/api/desktop-sync/export?username=${encodeURIComponent(username)}&key=${encodeURIComponent(licenseKey)}`,
+          { signal: ctrl.signal }
+        ).finally(() => clearTimeout(t));
+        if (resp.ok) {
+          const data = await resp.json().catch(() => ({}));
+          if (data?.success && data?.snapshot) {
+            snapshot = data.snapshot;
+            sourceLabel = `trực tiếp từ PC (${ip})`;
+            break;
+          }
+        }
+      } catch (_) {}
+    }
+  }
+
+  if (!snapshot) {
+    throw new Error('Chưa tìm thấy dữ liệu đồng bộ từ App Desktop của tài khoản ' + username + '. Hãy mở App EasyChat trên PC để đẩy dữ liệu đồng bộ.');
+  }
+
+  // Decrypt Page Access Tokens and merge Desktop data into Mobile store
+  const secretPrimary = `${username}:${licenseKey}`;
+  const secretFallback = `${String(snapshot.desktop_username || username).toLowerCase()}:${licenseKey}`;
+
+  if (Array.isArray(snapshot.lan_ips) && snapshot.lan_ips.length) {
+    store.desktopLanIps = snapshot.lan_ips;
+  }
+  if (Array.isArray(snapshot.accounts) && snapshot.accounts.length) {
+    store.accounts = snapshot.accounts.map((a) => ({
+      ...a,
+      is_extension_connected: true
+    }));
+  }
+  if (Array.isArray(snapshot.inboxSources)) {
+    const mergedSources = [];
+    for (const src of snapshot.inboxSources) {
+      let token = src.token || '';
+      if (!token && src.token_cipher) {
+        token = await xorDecipherBase64(src.token_cipher, secretPrimary);
+        if (!token || !token.startsWith('EA')) {
+          token = await xorDecipherBase64(src.token_cipher, secretFallback);
+        }
+      }
+      const prev = store.inboxSources.find((s) => String(s.id) === String(src.id) || String(s.external_id) === String(src.external_id));
+      mergedSources.push({
+        ...src,
+        token: (token && token.startsWith('EA')) ? token : (prev?.token || ''),
+        access_token_encrypted: 'mobile_local'
+      });
+    }
+    store.inboxSources = mergedSources;
+  }
+  if (snapshot.pageBridgeConfig) {
+    store.pageBridgeConfig = { ...store.pageBridgeConfig, ...snapshot.pageBridgeConfig };
+  }
+  if (Array.isArray(snapshot.leadStatuses) && snapshot.leadStatuses.length) {
+    store.leadStatuses = snapshot.leadStatuses;
+  }
+  if (Array.isArray(snapshot.quickTemplates)) {
+    store.quickTemplates = snapshot.quickTemplates;
+  }
+  if (Array.isArray(snapshot.autoReplyRules)) {
+    store.autoReplyRules = snapshot.autoReplyRules;
+  }
+  if (snapshot.contactsByThread && typeof snapshot.contactsByThread === 'object') {
+    store.contactsByThread = { ...store.contactsByThread, ...snapshot.contactsByThread };
+  }
+  if (snapshot.messagesByThread && typeof snapshot.messagesByThread === 'object') {
+    for (const [tid, msgs] of Object.entries(snapshot.messagesByThread)) {
+      if (!Array.isArray(msgs)) continue;
+      const existing = store.messagesByThread[tid] || [];
+      const byId = new Map();
+      for (const m of existing) byId.set(String(m.fb_message_id || m.id), m);
+      for (const m of msgs) byId.set(String(m.fb_message_id || m.id), m);
+      const combined = Array.from(byId.values()).sort((a, b) => (Number(a.timestamp_ms) || 0) - (Number(b.timestamp_ms) || 0));
+      store.messagesByThread[tid] = combined;
+    }
+  }
+  if (Array.isArray(snapshot.threads)) {
+    const byTid = new Map();
+    for (const t of store.threads) byTid.set(String(t.id), t);
+    for (const t of snapshot.threads) {
+      const tid = String(t.id);
+      const msgs = store.messagesByThread[tid] || [];
+      const lastMsgTs = msgs.length ? Number(msgs[msgs.length - 1]?.timestamp_ms || 0) : (Date.parse(t.last_activity || '') || Date.now());
+      byTid.set(tid, {
+        ...(byTid.get(tid) || {}),
+        ...t,
+        last_msg_ts: lastMsgTs
+      });
+    }
+    store.threads = Array.from(byTid.values());
+  }
+
+  saveStore();
+
+  // Also trigger live Graph API sync for any imported Fanpages with tokens
+  for (const src of store.inboxSources) {
+    if (src.source_type === 'page_messenger' && src.status === 'ACTIVE' && src.token) {
+      syncPageConversationsOnMobile(nativeFetch, src, { convLimit: 25, msgLimit: 30, broadcastRealtime: true }).catch(() => {});
+    }
+  }
+
+  const summary = {
+    success: true,
+    source_label: sourceLabel,
+    exported_at: snapshot.exported_at,
+    threads_count: store.threads.length,
+    pages_count: store.inboxSources.filter((s) => s.source_type === 'page_messenger').length
+  };
+  broadcastMobileSocket('THREADS_UPDATED', summary);
+  broadcastMobileSocket('DESKTOP_SYNC_COMPLETED', summary);
+  return summary;
+}
 
 function saveStore() {
   try {
@@ -524,13 +725,24 @@ function handleClientSocketEmit(event, payload = {}, ack) {
     }
     return;
   }
-  if (event === 'TOGGLE_SIDEBAR_SYNC') {
-    for (const src of store.inboxSources) {
-      if (src.source_type === 'page_messenger' && src.status === 'ACTIVE' && src.token) {
-        syncPageConversationsOnMobile(nativeFetch, src, { convLimit: 30, msgLimit: 30, broadcastRealtime: true }).catch(() => {});
-      }
+  if (event === 'TOGGLE_SIDEBAR_SYNC' || event === 'SET_SIDEBAR_SYNC_WINDOW') {
+    if (payload?.enabled === false) {
+      ack?.({ success: true, active: false, remaining_seconds: 0 });
+      return;
     }
-    ack?.({ success: true, active: true, remaining_seconds: 120 });
+    syncFromDesktopToMobile(nativeFetch)
+      .then((res) => {
+        ack?.({ success: true, active: true, remaining_seconds: 120, ...res });
+      })
+      .catch((err) => {
+        for (const src of store.inboxSources) {
+          if (src.source_type === 'page_messenger' && src.status === 'ACTIVE' && src.token) {
+            syncPageConversationsOnMobile(nativeFetch, src, { convLimit: 30, msgLimit: 30, broadcastRealtime: true }).catch(() => {});
+          }
+        }
+        broadcastMobileSocket('DESKTOP_SYNC_ERROR', { error: err.message });
+        ack?.({ success: false, error: err.message });
+      });
   }
 }
 
@@ -736,6 +948,9 @@ export async function handleMobileStandaloneApi(nativeFetch, urlStr, input, init
       const result = await resp.json().catch(() => ({}));
       if (result.success && result.data?.valid) {
         if (result.data.key) setStoredLicenseKey(result.data.key);
+        if (store.threads.length === 0) {
+          syncFromDesktopToMobile(nativeFetch).catch(() => {});
+        }
         return jsonResponse({
           success: true,
           data: { isLicensed: true, ...result.data }
@@ -818,8 +1033,19 @@ export async function handleMobileStandaloneApi(nativeFetch, urlStr, input, init
     return jsonResponse({ success: true });
   }
 
-  // 4. Accounts & Inbox Sources (Fanpage Messenger)
+  // 4. Desktop -> Mobile Sync API & Accounts & Inbox Sources
+  if ((pathname === '/api/mobile-sync/from-desktop' || pathname === '/api/desktop-sync/push-now') && method === 'POST') {
+    try {
+      const res = await syncFromDesktopToMobile(nativeFetch);
+      return jsonResponse(res);
+    } catch (err) {
+      return jsonResponse({ success: false, message: err.message }, 400);
+    }
+  }
   if (pathname === '/api/accounts' && method === 'GET') {
+    if (Array.isArray(store.accounts) && store.accounts.length > 0) {
+      return jsonResponse(store.accounts);
+    }
     return jsonResponse([
       {
         id: 'page_workspace',

@@ -921,9 +921,21 @@ export default function App() {
       setSidebarSyncUntil(nextUntil > Date.now() ? nextUntil : 0);
       setSidebarSyncClock(Date.now());
     };
+    const handleDesktopSyncDone = () => {
+      loadAccounts();
+      loadInboxSources();
+      loadThreads();
+      loadLeadStatuses();
+    };
     socket.on('SIDEBAR_SYNC_WINDOW_STATE', handleSyncWindowState);
-    return () => socket.off('SIDEBAR_SYNC_WINDOW_STATE', handleSyncWindowState);
-  }, [socket]);
+    socket.on('DESKTOP_SYNC_COMPLETED', handleDesktopSyncDone);
+    socket.on('THREADS_UPDATED', handleDesktopSyncDone);
+    return () => {
+      socket.off('SIDEBAR_SYNC_WINDOW_STATE', handleSyncWindowState);
+      socket.off('DESKTOP_SYNC_COMPLETED', handleDesktopSyncDone);
+      socket.off('THREADS_UPDATED', handleDesktopSyncDone);
+    };
+  }, [socket, loadAccounts, loadInboxSources, loadThreads, loadLeadStatuses]);
 
   const handleToggleSidebarSync = useCallback(() => {
     if (!socket || !isConnected) return;
@@ -933,12 +945,22 @@ export default function App() {
       duration_ms: 120000,
       account_ids: accountsRef.current.map((account) => account.id).filter(Boolean)
     });
+    if (enable) {
+      fetch('/api/mobile-sync/from-desktop', { method: 'POST' })
+        .then(() => {
+          loadAccounts();
+          loadInboxSources();
+          loadThreads();
+          loadLeadStatuses();
+        })
+        .catch(() => {});
+    }
     // Optimistic feedback keeps the button responsive while the server starts
     // or closes the two background Messenger surfaces.
     const now = Date.now();
     setSidebarSyncClock(now);
     setSidebarSyncUntil(enable ? now + 120000 : 0);
-  }, [socket, isConnected, sidebarSyncActive]);
+  }, [socket, isConnected, sidebarSyncActive, loadAccounts, loadInboxSources, loadThreads, loadLeadStatuses]);
 
   const requestThreadNavigation = useCallback((thread) => {
     if (!thread) return;
