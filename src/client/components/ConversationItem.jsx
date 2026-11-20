@@ -20,6 +20,7 @@ function formatTime(value) {
 }
 
 function ConversationItem({ thread, isSelected, onSelect, accounts = [], inboxSources = [], selectionMode = false, isChecked = false, onToggle, onToggleUnread, onTogglePin, reminderBellMuted, onToggleReminderBell, onCompleteReminder, onCancelReminder }) {
+  const [avatarError, setAvatarError] = React.useState(false);
   const account = accounts.find((item) => String(item.id) === String(thread.account_id));
   const source = inboxSources.find((item) => String(item.id) === String(thread.source_id));
   const isOnline = account ? account.is_extension_connected !== false : true;
@@ -134,8 +135,8 @@ function ConversationItem({ thread, isSelected, onSelect, accounts = [], inboxSo
         </span>
       )}
       <div className="relative flex-shrink-0">
-        {thread.avatar_url ? (
-          <img src={String(thread.avatar_url).startsWith('http') ? thread.avatar_url : '/api/avatars/' + thread.avatar_url} alt="" className="w-11 h-11 rounded-full object-cover border border-[var(--color-border)] shadow-sm" />
+        {thread.avatar_url && !avatarError ? (
+          <img src={String(thread.avatar_url).startsWith('http') ? thread.avatar_url : '/api/avatars/' + thread.avatar_url} alt="" className="w-11 h-11 rounded-full object-cover border border-[var(--color-border)] shadow-sm" onError={() => setAvatarError(true)} />
         ) : (
           <div className="w-11 h-11 rounded-full flex items-center justify-center text-[var(--color-text-on-accent)] font-semibold text-sm shadow-sm" style={{ backgroundColor: avatarColor }}>
             {title.charAt(0).toUpperCase()}

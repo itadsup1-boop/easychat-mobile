@@ -4,6 +4,49 @@ import App from './App.jsx';
 import './index.css';
 import { handleMobileStandaloneApi } from './mobileStandaloneEngine.js';
 
+// ─── Global ErrorBoundary ──────────────────────────────────────────────────
+class AppErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+  static getDerivedStateFromError(error) {
+    return { hasError: true, error };
+  }
+  componentDidCatch(error, info) {
+    console.error('[AppErrorBoundary] Caught error:', error, info);
+  }
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div style={{
+          display: 'flex', flexDirection: 'column', alignItems: 'center',
+          justifyContent: 'center', height: '100vh', padding: '24px',
+          background: '#0f1117', color: '#e2e8f0', fontFamily: 'sans-serif', textAlign: 'center'
+        }}>
+          <div style={{ fontSize: '48px', marginBottom: '16px' }}>⚠️</div>
+          <h2 style={{ fontSize: '18px', fontWeight: 700, marginBottom: '8px' }}>Đã xảy ra lỗi</h2>
+          <p style={{ fontSize: '13px', color: '#94a3b8', marginBottom: '24px' }}>
+            {this.state.error?.message || 'Lỗi không xác định'}
+          </p>
+          <button
+            onClick={() => { this.setState({ hasError: false, error: null }); }}
+            style={{
+              padding: '10px 24px', borderRadius: '8px', border: 'none',
+              background: '#2684ff', color: '#fff', fontSize: '14px',
+              fontWeight: 600, cursor: 'pointer'
+            }}
+          >
+            Thử lại
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+// ──────────────────────────────────────────────────────────────────────────
+
 export function getConfiguredApiBaseUrl() {
   try {
     const saved = String(window.localStorage?.getItem('easychat_server_url') || '').trim().replace(/\/+$/, '');
@@ -88,6 +131,8 @@ window.fetch = async (input, init = {}) => {
 
 ReactDOM.createRoot(document.getElementById('root')).render(
   <React.StrictMode>
-    <App />
+    <AppErrorBoundary>
+      <App />
+    </AppErrorBoundary>
   </React.StrictMode>
 );

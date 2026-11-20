@@ -48,6 +48,7 @@ export default function ChatHeader({
   onGoBack
 }) {
   if (!activeThread) return null;
+  const [avatarError, setAvatarError] = React.useState(false);
 
   const isAiPaused = activeThread.ai_paused_until && new Date(activeThread.ai_paused_until) > new Date();
   const account = accounts.find((item) => String(item.id) === String(activeThread.account_id));
@@ -114,11 +115,12 @@ export default function ChatHeader({
         )}
 
         <div className="relative shrink-0">
-          {activeThread.avatar_url ? (
+          {activeThread.avatar_url && !avatarError ? (
             <img
               src={String(activeThread.avatar_url).startsWith('http') ? activeThread.avatar_url : `/api/avatars/${activeThread.avatar_url}`}
               alt=""
               className="w-11 h-11 rounded-full object-cover border border-[var(--color-border)] shadow-sm"
+              onError={() => setAvatarError(true)}
             />
           ) : (
             <div
