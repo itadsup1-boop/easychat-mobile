@@ -4,9 +4,78 @@ import {
   ShieldCheck, UserPlus, Users
 } from 'lucide-react';
 import { useSocket } from '../hooks/useSocket.js';
+import { setSavedMobileUser, getSavedMobileUser } from '../mobileStandaloneEngine.js';
+
+const LICENSE_SERVER_BASE = 'https://genblackmmoonline.online/license_server';
+
+function isMobileApp() {
+  if (typeof window === 'undefined') return false;
+  const proto = String(window.location.protocol || '');
+  if (proto === 'capacitor:' || proto === 'file:') return true;
+  const host = String(window.location.hostname || '');
+  const port = String(window.location.port || '');
+  if ((host === 'localhost' || host === '127.0.0.1') && !port) return true;
+  return false;
+}
+
+async function cloudLogin(username, password) {
+  const resp = await fetch(`${LICENSE_SERVER_BASE}/api/client-auth/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: username.trim().toLowerCase(), password })
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok || !data.success) throw new Error(data.message || 'Đăng nhập thất bại.');
+  return data.user || { id: Date.now(), username: username.trim().toLowerCase(), email: username.trim().toLowerCase(), role: 'STAFF' };
+}
+
+async function cloudRegisterOtp(email) {
+  const resp = await fetch(`${LICENSE_SERVER_BASE}/api/client-auth/register-otp`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email })
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok || !data.success) throw new Error(data.message || 'Không thể gửi mã OTP.');
+  return data;
+}
+
+async function cloudRegister(email, password, otp) {
+  const resp = await fetch(`${LICENSE_SERVER_BASE}/api/client-auth/register`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: email, email, password, otp })
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok || !data.success) throw new Error(data.message || 'Không thể đăng ký.');
+  return data.user || { id: Date.now(), username: email, email, role: 'STAFF' };
+}
+
+async function cloudResetPasswordOtp(email) {
+  const resp = await fetch(`${LICENSE_SERVER_BASE}/api/client-auth/reset-password-otp`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email })
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok || !data.success) throw new Error(data.message || 'Không thể gửi mã OTP.');
+  return data;
+}
+
+async function cloudResetPassword(email, otp, password) {
+  const resp = await fetch(`${LICENSE_SERVER_BASE}/api/client-auth/reset-password`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email, otp, password })
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok || !data.success) throw new Error(data.message || 'Không thể đặt lại mật khẩu.');
+  return data;
+}
 
 export default function AuthScreen({ onAuthenticated }) {
   const { socket } = useSocket(true);
+  const mobile = isMobileApp();
   const googleButtonRef = useRef(null);
   const [mode, setMode] = useState('login'); // 'login' | 'register' | 'forgot'
   const [username, setUsername] = useState('');
@@ -53,12 +122,16 @@ export default function AuthScreen({ onAuthenticated }) {
     setError('');
     setSuccessMsg('');
     try {
-      const endpoint = mode === 'forgot' ? '/api/auth/reset-password-otp' : '/api/auth/register-otp';
-      const response = await fetch(endpoint, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email })
-      });
-      const result = await response.json().catch(() => ({}));
-      if (!response.ok || !result.success) throw new Error(result.message || 'Không thể gửi mã OTP.');
+      if (mobile) {
+        await (mode === 'forgot' ? cloudResetPasswordOtp(email) : cloudRegisterOtp(email));
+      } else {
+        const endpoint = mode === 'forgot' ? '/api/auth/reset-password-otp' : '/api/auth/register-otp';
+        const response = await fetch(endpoint, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email })
+        });
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok || !result.success) throw new Error(result.message || 'Không thể gửi mã OTP.');
+      }
       setOtpSent(true);
       setOtpCooldown(60);
     } catch (otpError) {
@@ -103,6 +176,16 @@ export default function AuthScreen({ onAuthenticated }) {
   }, [socket, onAuthenticated]);
 
   useEffect(() => {
+    // Trên app mobile: tự động restore session từ localStorage (không cần Desktop)
+    if (mobile) {
+      const savedUser = getSavedMobileUser();
+      if (savedUser?.username) {
+        onAuthenticated(savedUser);
+      }
+      return;
+    }
+
+    // Trên Desktop web: poll Desktop server session như cũ
     let authPollTimer = null;
     const pollAuthStatus = async () => {
       try {
@@ -125,7 +208,7 @@ export default function AuthScreen({ onAuthenticated }) {
     return () => {
       if (authPollTimer) clearInterval(authPollTimer);
     };
-  }, [onAuthenticated]);
+  }, [onAuthenticated, mobile]);
 
   useEffect(() => {
     if (mode === 'forgot' || isElectron) return;
@@ -188,14 +271,18 @@ export default function AuthScreen({ onAuthenticated }) {
       setLoading(true);
       try {
         const email = username.trim().toLowerCase();
-        const response = await fetch('/api/auth/reset-password', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ email, otp, password })
-        });
-        const result = await response.json().catch(() => ({}));
-        if (!response.ok || !result.success) throw new Error(result.message || 'Không thể đặt lại mật khẩu.');
-        setSuccessMsg(result.message || 'Đặt lại mật khẩu thành công! Vui lòng đăng nhập với mật khẩu mới.');
+        if (mobile) {
+          await cloudResetPassword(email, otp, password);
+        } else {
+          const response = await fetch('/api/auth/reset-password', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email, otp, password })
+          });
+          const result = await response.json().catch(() => ({}));
+          if (!response.ok || !result.success) throw new Error(result.message || 'Không thể đặt lại mật khẩu.');
+        }
+        setSuccessMsg('Đặt lại mật khẩu thành công! Vui lòng đăng nhập với mật khẩu mới.');
         switchMode('login');
       } catch (err) {
         setError(err.message);
@@ -211,14 +298,28 @@ export default function AuthScreen({ onAuthenticated }) {
     }
     setLoading(true);
     try {
-      const response = await fetch(`/api/auth/${mode}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(mode === 'register' ? { username: username.trim().toLowerCase(), email: username.trim().toLowerCase(), password, otp } : { username: username.trim().toLowerCase(), password })
-      });
-      const result = await response.json().catch(() => ({}));
-      if (!response.ok || !result.success) throw new Error(result.message || 'Không thể xác thực tài khoản.');
-      onAuthenticated(result.user);
+      let user;
+      if (mobile) {
+        const email = username.trim().toLowerCase();
+        if (mode === 'register') {
+          user = await cloudRegister(email, password, otp);
+        } else {
+          user = await cloudLogin(email, password);
+        }
+      } else {
+        const response = await fetch(`/api/auth/${mode}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(mode === 'register' ? { username: username.trim().toLowerCase(), email: username.trim().toLowerCase(), password, otp } : { username: username.trim().toLowerCase(), password })
+        });
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok || !result.success) throw new Error(result.message || 'Không thể xác thực tài khoản.');
+        user = result.user;
+      }
+      if (mobile && user) {
+        setSavedMobileUser(user);
+      }
+      onAuthenticated(user);
     } catch (submitError) {
       setError(submitError.message);
     } finally {

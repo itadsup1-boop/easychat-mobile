@@ -286,6 +286,10 @@ function setSavedUser(user) {
   } catch (_) {}
 }
 
+// Public aliases for AuthScreen (mobile standalone auth)
+export function getSavedMobileUser() { return getSavedUser(); }
+export function setSavedMobileUser(user) { setSavedUser(user); }
+
 // ── Virtual Socket Bus for Real-Time UI Updates on Mobile ──
 class VirtualMobileSocket {
   constructor() {
