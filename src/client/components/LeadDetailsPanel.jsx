@@ -740,7 +740,7 @@ export default function LeadDetailsPanel({ contactInfo, onSaveContact, onExportL
           type="button"
           onClick={async () => {
             const name = colorPickerTag.name;
-            setTagColors((prev) => ({ ...prev, [name.toLowerCase()]: { bg: colorPickerTag.bg, text: colorPickerTag.text } }));
+            setTagColors((prev) => ({ ...prev, [String(name || '').toLowerCase()]: { bg: colorPickerTag.bg, text: colorPickerTag.text } }));
             try {
               await fetch('/api/lead-tags', {
                 method: 'POST',
