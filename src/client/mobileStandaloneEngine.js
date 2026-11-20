@@ -13,48 +13,149 @@ const DEFAULT_LEAD_STATUSES = [
   { id: 5, name: 'Cần gọi lại', color: '#ef4444', sort_order: 5 }
 ];
 
+function isExpiredFbCdnUrl(url) {
+  if (!url || typeof url !== 'string') return false;
+  const match = url.match(/[?&]oe=([0-9a-fA-F]{8})(?:&|$)/);
+  if (!match) return false;
+  const expMs = parseInt(match[1], 16) * 1000;
+  return expMs > 1577836800000 && expMs < Date.now();
+}
+
+function sanitizeMobileAvatarUrl(rawUrl, { isPageSource = false, pageExternalId = '' } = {}) {
+  if (isPageSource && pageExternalId) {
+    const str = typeof rawUrl === 'string' ? rawUrl.trim() : '';
+    if (/^https?:\/\//i.test(str) && !isExpiredFbCdnUrl(str)) return str;
+    return `https://graph.facebook.com/${pageExternalId}/picture?type=normal`;
+  }
+  if (!rawUrl || typeof rawUrl !== 'string') return null;
+  const trimmed = rawUrl.trim();
+  if (!trimmed) return null;
+  if (/^data:image\//i.test(trimmed)) return trimmed;
+  if (!/^https?:\/\//i.test(trimmed)) return null;
+  if (isExpiredFbCdnUrl(trimmed)) return null;
+  if (/graph\.facebook\.com\/(?:v[\d.]+\/)?\d+\/picture/i.test(trimmed) && trimmed.includes('access_token=')) {
+    return null;
+  }
+  return trimmed;
+}
+
+function normalizeLoadedStore(data) {
+  const next = {
+    inboxSources: Array.isArray(data.inboxSources) ? data.inboxSources : [],
+    accounts: Array.isArray(data.accounts) ? data.accounts : [],
+    desktopLanIps: Array.isArray(data.desktopLanIps) ? data.desktopLanIps : [],
+    threads: Array.isArray(data.threads) ? data.threads : [],
+    messagesByThread: data.messagesByThread && typeof data.messagesByThread === 'object' ? { ...data.messagesByThread } : {},
+    contactsByThread: data.contactsByThread && typeof data.contactsByThread === 'object' ? { ...data.contactsByThread } : {},
+    leadStatuses: Array.isArray(data.leadStatuses) && data.leadStatuses.length ? data.leadStatuses : DEFAULT_LEAD_STATUSES,
+    quickTemplates: Array.isArray(data.quickTemplates) ? data.quickTemplates : [],
+    autoReplyRules: Array.isArray(data.autoReplyRules) ? data.autoReplyRules : [],
+    campaigns: Array.isArray(data.campaigns) ? data.campaigns : [],
+    employees: Array.isArray(data.employees) ? data.employees : [],
+    aiConfig: data.aiConfig || { enabled: false, provider: 'openai', model: 'gpt-4o-mini', system_prompt: '' },
+    phoneAutomation: data.phoneAutomation || { enabled: true, policy: 'continue', thank_you_text: '', target_status_id: null },
+    pageBridgeConfig: data.pageBridgeConfig || { bridge_url: 'https://genblackmmoonline.online/webhook.php', verify_token: 'crmwb_mobile_verify' }
+  };
+
+  next.inboxSources = next.inboxSources.map((s) => ({
+    ...s,
+    avatar_url: sanitizeMobileAvatarUrl(s.avatar_url, {
+      isPageSource: s.source_type === 'page_messenger',
+      pageExternalId: String(s.external_id || '')
+    })
+  }));
+
+  next.accounts = next.accounts.map((a) => ({
+    ...a,
+    avatar_url: sanitizeMobileAvatarUrl(a.avatar_url)
+  }));
+
+  for (const tid of Object.keys(next.messagesByThread)) {
+    const arr = Array.isArray(next.messagesByThread[tid]) ? next.messagesByThread[tid] : [];
+    next.messagesByThread[tid] = arr.map((m) => (
+      m && typeof m.message === 'object' && m.message !== null && m.content === undefined
+        ? { ...m, ...m.message }
+        : m
+    ));
+  }
+
+  const canonicalByPagePsid = new Map();
+  for (const t of next.threads) {
+    const tid = String(t.id || '');
+    if (!tid.startsWith('page:')) {
+      const psid = String(t.external_thread_id || tid);
+      const srcKey = String(t.source_id || t.source_external_id || '');
+      if (srcKey && psid) canonicalByPagePsid.set(`${srcKey}:${psid}`, tid);
+    }
+  }
+
+  const dedupedThreads = [];
+  const seenThreadIds = new Set();
+  for (const rawThread of next.threads) {
+    const tid = String(rawThread.id || '');
+    if (!tid) continue;
+    if (tid.startsWith('page:')) {
+      const parts = tid.split(':');
+      const pageExtId = parts[1] || '';
+      const psid = parts.slice(2).join(':') || String(rawThread.external_thread_id || '');
+      const canonicalTid = canonicalByPagePsid.get(`${String(rawThread.source_id || '')}:${psid}`)
+        || canonicalByPagePsid.get(`${pageExtId}:${psid}`);
+      if (canonicalTid && canonicalTid !== tid) {
+        const dupMsgs = next.messagesByThread[tid] || [];
+        if (dupMsgs.length) {
+          const baseMsgs = next.messagesByThread[canonicalTid] || [];
+          const byMsgId = new Map();
+          for (const m of [...baseMsgs, ...dupMsgs]) {
+            byMsgId.set(String(m.fb_message_id || m.client_message_id || m.id), { ...m, thread_id: canonicalTid });
+          }
+          next.messagesByThread[canonicalTid] = Array.from(byMsgId.values()).sort(
+            (a, b) => (Number(a.timestamp_ms) || 0) - (Number(b.timestamp_ms) || 0)
+          );
+          delete next.messagesByThread[tid];
+        }
+        continue;
+      }
+    }
+    if (seenThreadIds.has(tid)) continue;
+    seenThreadIds.add(tid);
+    const pinnedVal = Number(rawThread.pinned ?? rawThread.is_pinned ?? 0) ? 1 : 0;
+    dedupedThreads.push({
+      ...rawThread,
+      avatar_url: sanitizeMobileAvatarUrl(rawThread.avatar_url),
+      pinned: pinnedVal,
+      is_pinned: pinnedVal
+    });
+  }
+  next.threads = dedupedThreads;
+
+  for (const tid of Object.keys(next.contactsByThread)) {
+    const c = next.contactsByThread[tid];
+    if (c && typeof c === 'object') {
+      next.contactsByThread[tid] = {
+        ...c,
+        avatar_url: sanitizeMobileAvatarUrl(c.avatar_url)
+      };
+    }
+  }
+
+  return next;
+}
+
 function loadStore() {
   try {
     const raw = window.localStorage?.getItem(STORAGE_KEY);
     if (raw) {
-      const parsed = JSON.parse(raw);
-      return {
-        inboxSources: Array.isArray(parsed.inboxSources) ? parsed.inboxSources : [],
-        accounts: Array.isArray(parsed.accounts) ? parsed.accounts : [],
-        desktopLanIps: Array.isArray(parsed.desktopLanIps) ? parsed.desktopLanIps : [],
-        threads: Array.isArray(parsed.threads) ? parsed.threads : [],
-        messagesByThread: parsed.messagesByThread && typeof parsed.messagesByThread === 'object' ? parsed.messagesByThread : {},
-        contactsByThread: parsed.contactsByThread && typeof parsed.contactsByThread === 'object' ? parsed.contactsByThread : {},
-        leadStatuses: Array.isArray(parsed.leadStatuses) && parsed.leadStatuses.length ? parsed.leadStatuses : DEFAULT_LEAD_STATUSES,
-        quickTemplates: Array.isArray(parsed.quickTemplates) ? parsed.quickTemplates : [],
-        autoReplyRules: Array.isArray(parsed.autoReplyRules) ? parsed.autoReplyRules : [],
-        campaigns: Array.isArray(parsed.campaigns) ? parsed.campaigns : [],
-        employees: Array.isArray(parsed.employees) ? parsed.employees : [],
-        aiConfig: parsed.aiConfig || { enabled: false, provider: 'openai', model: 'gpt-4o-mini', system_prompt: '' },
-        phoneAutomation: parsed.phoneAutomation || { enabled: true, policy: 'continue', thank_you_text: '', target_status_id: null },
-        pageBridgeConfig: parsed.pageBridgeConfig || { bridge_url: 'https://genblackmmoonline.online/webhook.php', verify_token: 'crmwb_mobile_verify' }
-      };
+      return normalizeLoadedStore(JSON.parse(raw));
     }
   } catch (_) {}
-  return {
-    inboxSources: [],
-    accounts: [],
-    threads: [],
-    messagesByThread: {},
-    contactsByThread: {},
-    leadStatuses: DEFAULT_LEAD_STATUSES,
-    quickTemplates: [],
-    autoReplyRules: [],
-    campaigns: [],
-    employees: [],
-    aiConfig: { enabled: false, provider: 'openai', model: 'gpt-4o-mini', system_prompt: '' },
-    phoneAutomation: { enabled: true, policy: 'continue', thank_you_text: '', target_status_id: null },
-    pageBridgeConfig: { bridge_url: 'https://genblackmmoonline.online/webhook.php', verify_token: 'crmwb_mobile_verify' }
-  };
+  return normalizeLoadedStore({});
 }
 
 let store = loadStore();
 const stagedFiles = new Map(); // attachment_id -> { id, file, preview_url, media_type, name, size, mime_type }
+let activeOpenThreadId = null;
+const profileCheckedAt = new Map(); // psid -> timestampMs
+const profileInFlight = new Set();
 
 async function sha256Bytes(inputStr) {
   const data = new TextEncoder().encode(String(inputStr || ''));
@@ -233,6 +334,7 @@ export async function syncFromDesktopToMobile(nativeFetch = window._easychatNati
     store.threads = nextThreads;
   }
 
+  store = normalizeLoadedStore(store);
   saveStore();
 
   // Also trigger live Graph API sync for any imported Fanpages with tokens
@@ -250,6 +352,7 @@ export async function syncFromDesktopToMobile(nativeFetch = window._easychatNati
     pages_count: store.inboxSources.filter((s) => s.source_type === 'page_messenger').length
   };
   broadcastMobileSocket('THREADS_UPDATED', summary);
+  broadcastMobileSocket('THREAD_LIST_UPDATED', summary);
   broadcastMobileSocket('DESKTOP_SYNC_COMPLETED', summary);
   return summary;
 }
@@ -415,6 +518,85 @@ function parseGraphMessage(msgNode, pageId, threadId, customerName) {
   };
 }
 
+function findExistingPageThreadIndex(source, pageId, psid) {
+  const srcIdStr = String(source?.id || '');
+  const prefixedId = `page:${pageId}:${psid}`;
+  // 1. Exact match on source + (bare psid or external_thread_id or page:<pid>:<psid>)
+  const bySourceIdx = store.threads.findIndex((t) => {
+    const sameSource = (srcIdStr && String(t.source_id || '') === srcIdStr)
+      || String(t.source_external_id || '') === pageId;
+    if (!sameSource) return false;
+    const tid = String(t.id || '');
+    const ext = String(t.external_thread_id || '');
+    return tid === psid || ext === psid || tid === prefixedId;
+  });
+  if (bySourceIdx >= 0) return bySourceIdx;
+  // 2. Fallback match on page:<pid>:<psid> or bare psid for page_messenger
+  return store.threads.findIndex((t) => {
+    const tid = String(t.id || '');
+    if (tid === prefixedId) return true;
+    return t.source_type === 'page_messenger' && tid === psid && !t.source_external_id;
+  });
+}
+
+async function enrichCustomerProfileOnMobile(nativeFetch, source, threadId, psid) {
+  if (!source?.token || !psid || !threadId) return;
+  const key = `${source.external_id}:${psid}`;
+  if (profileInFlight.has(key)) return;
+  const lastChecked = profileCheckedAt.get(key) || 0;
+  if (Date.now() - lastChecked < 30 * 60 * 1000) return;
+
+  profileInFlight.add(key);
+  profileCheckedAt.set(key, Date.now());
+  try {
+    const data = await graphFetch(nativeFetch, String(psid), {
+      fields: 'first_name,last_name,profile_pic',
+      access_token: source.token
+    });
+    const fullName = [data?.first_name, data?.last_name].filter(Boolean).join(' ').trim() || null;
+    const profilePic = sanitizeMobileAvatarUrl(data?.profile_pic);
+    if (!fullName && !profilePic) return;
+
+    let changed = false;
+    const idx = store.threads.findIndex((t) => String(t.id) === String(threadId));
+    if (idx >= 0) {
+      const cur = store.threads[idx];
+      const nextAvatar = profilePic || cur.avatar_url || null;
+      const curName = String(cur.contact_name || '').trim();
+      const shouldUpdateName = fullName && (!curName || /^Khách hàng/i.test(curName));
+      if (nextAvatar !== cur.avatar_url || shouldUpdateName) {
+        store.threads[idx] = {
+          ...cur,
+          avatar_url: nextAvatar,
+          ...(shouldUpdateName ? { contact_name: fullName } : {})
+        };
+        changed = true;
+      }
+    }
+    const curContact = store.contactsByThread[threadId] || { thread_id: threadId };
+    if (profilePic && curContact.avatar_url !== profilePic) {
+      store.contactsByThread[threadId] = {
+        ...curContact,
+        ...(fullName && !curContact.name ? { name: fullName } : {}),
+        avatar_url: profilePic
+      };
+      changed = true;
+    }
+    if (changed) {
+      saveStore();
+      broadcastMobileSocket('CONTACT_UPDATED', {
+        thread_id: threadId,
+        ...(fullName ? { name: fullName } : {}),
+        ...(profilePic ? { avatar_url: profilePic } : {})
+      });
+    }
+  } catch (_) {
+    // PSID profile lookup may fail if user privacy restricts Messenger profile_pic; keep initials fallback
+  } finally {
+    profileInFlight.delete(key);
+  }
+}
+
 export async function syncPageConversationsOnMobile(nativeFetch, source, options = {}) {
   if (!source || !source.token || source.status !== 'ACTIVE') return { syncedThreads: 0, newMessages: 0 };
   const pageId = String(source.external_id);
@@ -438,26 +620,35 @@ export async function syncPageConversationsOnMobile(nativeFetch, source, options
     const psid = String(customer.id || conv.id || '');
     if (!psid) continue;
 
-    const threadId = `page:${pageId}:${psid}`;
+    const existingThreadIdx = findExistingPageThreadIndex(source, pageId, psid);
+    const existingThread = existingThreadIdx >= 0 ? store.threads[existingThreadIdx] : null;
+    const bareIdTakenByOther = !existingThread && store.threads.some((t) => String(t.id) === psid);
+    const threadId = existingThread
+      ? String(existingThread.id)
+      : (bareIdTakenByOther ? `page:${pageId}:${psid}` : psid);
+
     const customerName = String(customer.name || 'Khách hàng Fanpage').trim();
-    const customerAvatar = `https://graph.facebook.com/${psid}/picture?type=normal&access_token=${encodeURIComponent(pageToken)}`;
     const updatedMs = Date.parse(conv.updated_time || '') || Date.now();
 
     const rawMsgs = Array.isArray(conv?.messages?.data) ? conv.messages.data.slice().reverse() : [];
     const parsedMsgs = rawMsgs.map((m) => parseGraphMessage(m, pageId, threadId, customerName));
 
-    const existingMsgs = store.messagesByThread[threadId] || [];
+    const existingMsgs = (store.messagesByThread[threadId] || []).slice();
     const existingIds = new Set(existingMsgs.map((m) => String(m.fb_message_id || m.id)));
+    let maxExistingSeq = existingMsgs.reduce((mx, m) => Math.max(mx, Number(m?.sequence_order ?? m?.id) || 0), 0);
     const newlyArrived = [];
 
     for (const pm of parsedMsgs) {
       if (!existingIds.has(String(pm.fb_message_id))) {
-        existingMsgs.push(pm);
+        const nextSeq = Math.max(Number(pm.sequence_order) || 0, maxExistingSeq + 1);
+        maxExistingSeq = nextSeq;
+        const enrichedPm = { ...pm, thread_id: threadId, sequence_order: nextSeq };
+        existingMsgs.push(enrichedPm);
         existingIds.add(String(pm.fb_message_id));
-        newlyArrived.push(pm);
+        newlyArrived.push(enrichedPm);
         newMessagesCount += 1;
-        if (!pm.is_outgoing && pm.content) {
-          const detectedPhone = extractPhoneFromText(pm.content);
+        if (!enrichedPm.is_outgoing && enrichedPm.content) {
+          const detectedPhone = extractPhoneFromText(enrichedPm.content);
           if (detectedPhone) {
             const existingContact = store.contactsByThread[threadId] || {};
             if (!existingContact.phone) {
@@ -484,15 +675,17 @@ export async function syncPageConversationsOnMobile(nativeFetch, source, options
           : (lastMsgObj.media_type === 'video' ? '[Video]' : '[Ảnh]'))
       : 'Chưa có tin nhắn';
 
-    const existingThreadIdx = store.threads.findIndex((t) => String(t.id) === threadId);
-    const existingThread = existingThreadIdx >= 0 ? store.threads[existingThreadIdx] : null;
     const contactRecord = store.contactsByThread[threadId] || {};
+    const validAvatar = sanitizeMobileAvatarUrl(contactRecord.avatar_url || existingThread?.avatar_url);
+    const pinnedVal = Number(existingThread?.pinned ?? existingThread?.is_pinned ?? 0) ? 1 : 0;
+    const isCurrentlyOpen = String(activeOpenThreadId || '') === threadId;
 
     const nextThread = {
+      ...(existingThread || {}),
       id: threadId,
       external_thread_id: psid,
       conversation_graph_id: conv.id,
-      account_id: source.owner_account_id || 'page_workspace',
+      account_id: existingThread?.account_id || source.owner_account_id || 'page_workspace',
       source_id: source.id,
       source_type: 'page_messenger',
       source_name: source.display_name,
@@ -500,19 +693,22 @@ export async function syncPageConversationsOnMobile(nativeFetch, source, options
       source_status: source.status,
       contact_name: contactRecord.name || existingThread?.contact_name || customerName,
       nickname: contactRecord.nickname || existingThread?.nickname || null,
-      avatar_url: existingThread?.avatar_url || customerAvatar,
+      avatar_url: validAvatar,
       phone: contactRecord.phone || existingThread?.phone || null,
       last_message: lastPreview,
       last_activity: new Date(lastMsgObj?.timestamp_ms || updatedMs).toISOString(),
       last_msg_ts: lastMsgObj?.timestamp_ms || updatedMs,
-      is_unread: existingThread
-        ? (newlyArrived.some((m) => !m.is_outgoing) ? 1 : existingThread.is_unread)
-        : (Number(conv.unread_count) > 0 ? 1 : 0),
+      is_unread: isCurrentlyOpen
+        ? 0
+        : (existingThread
+            ? (newlyArrived.some((m) => !m.is_outgoing) ? 1 : Number(existingThread.is_unread || 0))
+            : (Number(conv.unread_count) > 0 ? 1 : 0)),
       status: existingThread?.status || 'UNPROCESSED',
       lead_status_id: contactRecord.lead_status_id ?? existingThread?.lead_status_id ?? null,
       is_vip: contactRecord.is_vip ?? existingThread?.is_vip ?? 0,
-       is_pinned: existingThread?.is_pinned || 0,
-      inbox_folder: 'INBOX',
+      pinned: pinnedVal,
+      is_pinned: pinnedVal,
+      inbox_folder: existingThread?.inbox_folder || 'INBOX',
       archived_at: existingThread?.archived_at || null,
       reminder_due_at: existingThread?.reminder_due_at || null,
       reminder_note: existingThread?.reminder_note || null
@@ -528,7 +724,7 @@ export async function syncPageConversationsOnMobile(nativeFetch, source, options
       store.contactsByThread[threadId] = {
         thread_id: threadId,
         name: customerName,
-        avatar_url: customerAvatar,
+        avatar_url: validAvatar,
         phone: nextThread.phone || '',
         email: '',
         address: '',
@@ -538,26 +734,47 @@ export async function syncPageConversationsOnMobile(nativeFetch, source, options
       };
     }
 
+    if (!validAvatar && (isCurrentlyOpen || newlyArrived.length > 0)) {
+      enrichCustomerProfileOnMobile(nativeFetch, source, threadId, psid).catch(() => {});
+    }
+
     syncedThreads += 1;
 
     if (newlyArrived.length > 0 && options.broadcastRealtime) {
       for (const nm of newlyArrived) {
         broadcastMobileSocket('NEW_MESSAGE', {
+          ...nm,
           thread_id: threadId,
           account_id: nextThread.account_id,
           source_id: source.id,
           source_type: 'page_messenger',
-          contact_name: nextThread.contact_name,
-          message: nm
+          source_name: source.display_name,
+          page_id: pageId,
+          thread_summary: nextThread
         });
       }
-      broadcastMobileSocket('THREAD_UPDATED', nextThread);
+      broadcastMobileSocket('THREAD_MESSAGES_UPDATED', {
+        thread_id: threadId,
+        account_id: nextThread.account_id,
+        messages: existingMsgs,
+        authoritative: true
+      });
+      broadcastMobileSocket('THREAD_LIST_UPDATED', {
+        thread_id: threadId,
+        account_id: nextThread.account_id,
+        new_messages: newlyArrived.length,
+        page_id: pageId
+      });
     }
   }
 
   saveStore();
-  if (syncedThreads > 0) {
-    broadcastMobileSocket('THREADS_UPDATED', { count: syncedThreads });
+  if (newMessagesCount > 0) {
+    broadcastMobileSocket('THREAD_LIST_UPDATED', {
+      account_id: source.owner_account_id || null,
+      new_messages: newMessagesCount,
+      page_id: pageId
+    });
   }
   return { syncedThreads, newMessages: newMessagesCount };
 }
@@ -566,14 +783,17 @@ async function sendPageMessageOnMobile(nativeFetch, { threadId, content, attachm
   const thread = store.threads.find((t) => String(t.id) === String(threadId));
   if (!thread) throw new Error('Không tìm thấy hội thoại Fanpage');
   const source = store.inboxSources.find((s) => String(s.id) === String(thread.source_id))
+    || store.inboxSources.find((s) => s.source_type === 'page_messenger' && String(s.external_id) === String(thread.source_external_id || '') && s.token)
     || store.inboxSources.find((s) => s.source_type === 'page_messenger' && s.status === 'ACTIVE' && s.token);
   if (!source || !source.token) {
-    throw new Error('Fanpage chưa có Page Access Token. Vui lòng vào mục Fanpage để nhập Token.');
+    throw new Error('Fanpage chưa có Page Access Token. Vui lòng đồng bộ lại từ App Desktop hoặc nhập Token.');
   }
 
   const pageId = String(source.external_id);
   const psid = String(thread.external_thread_id || String(threadId).split(':').pop());
   const createdMessages = [];
+  const existingList = store.messagesByThread[thread.id] || [];
+  let maxSeq = existingList.reduce((mx, m) => Math.max(mx, Number(m?.sequence_order ?? m?.id) || 0), 0);
 
   // 1. Send attachments first if any
   for (const attId of attachmentIds) {
@@ -598,6 +818,7 @@ async function sendPageMessageOnMobile(nativeFetch, { threadId, content, attachm
     }
     const mid = data.message_id || `m_att_${Date.now()}`;
     const nowMs = Date.now();
+    maxSeq = Math.max(nowMs, maxSeq + 1);
     const attMsg = {
       id: mid,
       fb_message_id: mid,
@@ -615,12 +836,15 @@ async function sendPageMessageOnMobile(nativeFetch, { threadId, content, attachm
       status: 'sent',
       delivery_status: 'sent',
       timestamp_ms: nowMs,
-      sequence_order: nowMs,
+      sequence_order: maxSeq,
       created_at: new Date(nowMs).toISOString()
     };
     if (!store.messagesByThread[thread.id]) store.messagesByThread[thread.id] = [];
     store.messagesByThread[thread.id].push(attMsg);
     createdMessages.push(attMsg);
+    thread.last_message = staged.media_type === 'video' ? 'Bạn: [Video]' : 'Bạn: [Ảnh]';
+    thread.last_activity = new Date(nowMs).toISOString();
+    thread.last_msg_ts = nowMs;
   }
 
   // 2. Send text content if any
@@ -642,6 +866,7 @@ async function sendPageMessageOnMobile(nativeFetch, { threadId, content, attachm
     }
     const mid = data.message_id || `m_${Date.now()}`;
     const nowMs = Date.now();
+    maxSeq = Math.max(nowMs, maxSeq + 1);
     const txtMsg = {
       id: mid,
       fb_message_id: mid,
@@ -658,7 +883,7 @@ async function sendPageMessageOnMobile(nativeFetch, { threadId, content, attachm
       status: 'sent',
       delivery_status: 'sent',
       timestamp_ms: nowMs,
-      sequence_order: nowMs,
+      sequence_order: maxSeq,
       created_at: new Date(nowMs).toISOString()
     };
     if (!store.messagesByThread[thread.id]) store.messagesByThread[thread.id] = [];
@@ -669,25 +894,31 @@ async function sendPageMessageOnMobile(nativeFetch, { threadId, content, attachm
     thread.last_msg_ts = nowMs;
   }
 
+  thread.is_unread = 0;
   saveStore();
   for (const m of createdMessages) {
-    broadcastMobileSocket('MESSAGE_SENT_CONFIRMATION', {
+    broadcastMobileSocket('MESSAGE_SENT', {
       thread_id: thread.id,
       client_message_id: m.client_message_id,
       fb_message_id: m.fb_message_id,
-      status: 'sent',
-      delivery_status: 'sent',
-      message: m
+      provisional: false
     });
     broadcastMobileSocket('NEW_MESSAGE', {
+      ...m,
       thread_id: thread.id,
       account_id: thread.account_id,
       source_id: thread.source_id,
       source_type: 'page_messenger',
-      message: m
+      source_name: source.display_name,
+      page_id: pageId,
+      thread_summary: thread
     });
   }
-  broadcastMobileSocket('THREAD_UPDATED', thread);
+  broadcastMobileSocket('THREAD_LIST_UPDATED', {
+    thread_id: thread.id,
+    account_id: thread.account_id,
+    page_id: pageId
+  });
   return createdMessages;
 }
 
@@ -715,14 +946,18 @@ function handleClientSocketEmit(event, payload = {}, ack) {
   }
   if (event === 'REQUEST_THREAD_HISTORY_SYNC' || event === 'RESYNC_THREAD') {
     const tid = String(payload.thread_id || '');
+    if (tid) activeOpenThreadId = tid;
     const thread = store.threads.find((t) => String(t.id) === tid);
-    const source = store.inboxSources.find((s) => String(s.id) === String(thread?.source_id));
+    const source = store.inboxSources.find((s) => String(s.id) === String(thread?.source_id))
+      || store.inboxSources.find((s) => s.source_type === 'page_messenger' && String(s.external_id) === String(thread?.source_external_id || '') && s.token);
     if (source) {
       syncPageConversationsOnMobile(nativeFetch, source, { convLimit: 25, msgLimit: 50, broadcastRealtime: true })
         .then(() => {
-          broadcastMobileSocket('THREAD_MESSAGES_SYNCED', {
+          broadcastMobileSocket('THREAD_MESSAGES_UPDATED', {
             thread_id: tid,
-            messages: store.messagesByThread[tid] || []
+            account_id: thread?.account_id || null,
+            messages: store.messagesByThread[tid] || [],
+            authoritative: true
           });
         })
         .catch(() => {});
@@ -750,22 +985,74 @@ function handleClientSocketEmit(event, payload = {}, ack) {
   }
 }
 
-// Background 6-second poller for active Fanpages on mobile
+// Fast priority poller (2.5s) for open conversation + batched background poller (8s) for all Fanpages
 let pollerStarted = false;
+let activePollerBusy = false;
+let bgPollerBusy = false;
+
 export function startMobilePagePoller(nativeFetch) {
   if (pollerStarted) return;
   pollerStarted = true;
-  setInterval(async () => {
+
+  const pollActiveOpenThreadPage = async () => {
+    if (activePollerBusy || !activeOpenThreadId) return;
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
     const user = getSavedUser();
     if (!user) return;
-    for (const src of store.inboxSources) {
-      if (src.source_type === 'page_messenger' && src.status === 'ACTIVE' && src.token) {
-        try {
-          await syncPageConversationsOnMobile(nativeFetch, src, { convLimit: 15, msgLimit: 15, broadcastRealtime: true });
-        } catch (_) {}
-      }
+    const openThread = store.threads.find((t) => String(t.id) === String(activeOpenThreadId));
+    if (!openThread || openThread.source_type !== 'page_messenger') return;
+    const src = store.inboxSources.find((s) => String(s.id) === String(openThread.source_id))
+      || store.inboxSources.find((s) => s.source_type === 'page_messenger' && String(s.external_id) === String(openThread.source_external_id || '') && s.token);
+    if (!src || src.status !== 'ACTIVE' || !src.token) return;
+
+    activePollerBusy = true;
+    try {
+      await syncPageConversationsOnMobile(nativeFetch, src, { convLimit: 12, msgLimit: 25, broadcastRealtime: true });
+    } catch (_) {
+    } finally {
+      activePollerBusy = false;
     }
-  }, 6000);
+  };
+
+  const pollAllPagesBackground = async () => {
+    if (bgPollerBusy) return;
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+    const user = getSavedUser();
+    if (!user) return;
+    const activeSources = store.inboxSources.filter(
+      (s) => s.source_type === 'page_messenger' && s.status === 'ACTIVE' && s.token
+    );
+    if (!activeSources.length) return;
+
+    bgPollerBusy = true;
+    try {
+      const BATCH_SIZE = 4;
+      for (let i = 0; i < activeSources.length; i += BATCH_SIZE) {
+        const batch = activeSources.slice(i, i + BATCH_SIZE);
+        await Promise.allSettled(
+          batch.map((src) =>
+            syncPageConversationsOnMobile(nativeFetch, src, { convLimit: 15, msgLimit: 15, broadcastRealtime: true })
+          )
+        );
+      }
+    } catch (_) {
+    } finally {
+      bgPollerBusy = false;
+    }
+  };
+
+  setInterval(pollActiveOpenThreadPage, 2500);
+  setInterval(pollAllPagesBackground, 8000);
+
+  if (typeof document !== 'undefined') {
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') {
+        store = normalizeLoadedStore(store);
+        pollActiveOpenThreadPage();
+        pollAllPagesBackground();
+      }
+    });
+  }
 }
 
 function jsonResponse(body, status = 200) {
@@ -1225,6 +1512,7 @@ export async function handleMobileStandaloneApi(nativeFetch, urlStr, input, init
   if (threadMessagesMatch) {
     const tid = decodeURIComponent(threadMessagesMatch[1]);
     if (method === 'GET') {
+      activeOpenThreadId = tid;
       const list = store.messagesByThread[tid] || [];
       return jsonResponse(list);
     }
@@ -1254,7 +1542,8 @@ export async function handleMobileStandaloneApi(nativeFetch, urlStr, input, init
   if (threadUnreadMatch && method === 'POST') {
     const tid = decodeURIComponent(threadUnreadMatch[1]);
     const body = await parseRequestBody(input, init);
-    store.threads = store.threads.map((t) => (String(t.id) === tid ? { ...t, is_unread: body.is_unread ? 1 : 0 } : t));
+    const nextUnread = (body.unread ?? body.is_unread) ? 1 : 0;
+    store.threads = store.threads.map((t) => (String(t.id) === tid ? { ...t, is_unread: nextUnread } : t));
     saveStore();
     return jsonResponse({ success: true });
   }
@@ -1262,7 +1551,10 @@ export async function handleMobileStandaloneApi(nativeFetch, urlStr, input, init
   if (threadPinMatch && method === 'POST') {
     const tid = decodeURIComponent(threadPinMatch[1]);
     const body = await parseRequestBody(input, init);
-    store.threads = store.threads.map((t) => (String(t.id) === tid ? { ...t, is_pinned: body.is_pinned ? 1 : 0 } : t));
+    const nextPinned = (body.pinned ?? body.is_pinned) ? 1 : 0;
+    store.threads = store.threads.map((t) => (
+      String(t.id) === tid ? { ...t, pinned: nextPinned, is_pinned: nextPinned } : t
+    ));
     saveStore();
     return jsonResponse({ success: true });
   }
@@ -1353,7 +1645,19 @@ export async function handleMobileStandaloneApi(nativeFetch, urlStr, input, init
   if (contactMatch) {
     const tid = decodeURIComponent(contactMatch[1]);
     if (method === 'GET') {
-      return jsonResponse(store.contactsByThread[tid] || { thread_id: tid });
+      activeOpenThreadId = tid;
+      const existingContact = store.contactsByThread[tid] || { thread_id: tid };
+      const cleanedAvatar = sanitizeMobileAvatarUrl(existingContact.avatar_url);
+      const thread = store.threads.find((t) => String(t.id) === tid);
+      if (!cleanedAvatar && thread && thread.source_type === 'page_messenger') {
+        const src = store.inboxSources.find((s) => String(s.id) === String(thread.source_id))
+          || store.inboxSources.find((s) => s.source_type === 'page_messenger' && String(s.external_id) === String(thread.source_external_id || '') && s.token);
+        const psid = String(thread.external_thread_id || String(tid).split(':').pop());
+        if (src && psid) {
+          enrichCustomerProfileOnMobile(nativeFetch, src, tid, psid).catch(() => {});
+        }
+      }
+      return jsonResponse({ ...existingContact, avatar_url: cleanedAvatar });
     }
     if (method === 'PUT' || method === 'POST') {
       const body = await parseRequestBody(input, init);

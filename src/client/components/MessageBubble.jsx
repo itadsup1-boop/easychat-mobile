@@ -2,6 +2,7 @@
 import { AlertTriangle, Check, CheckCheck, RefreshCw, Loader2, Phone, Video, PhoneMissed, PhoneCall, PhoneIncoming } from 'lucide-react';
 import MediaViewer from './MediaViewer.jsx';
 import { getMessageDisplayTime, isConfirmedOutgoing } from '../utils/messageTimestampPresentation.js';
+import { resolveRenderableAvatarUrl } from '../utils/avatarUrl.js';
 
 const AVATAR_COLORS = ['#3b82f6', '#8b5cf6', '#10b981', '#ec4899', '#f97316', '#14b8a6', '#6366f1', '#ef4444'];
 
@@ -19,14 +20,12 @@ function IncomingAvatar({ url, initial, color, threadId, size = 'md' }) {
     ? 'w-4 h-4 text-[7px]'
     : 'w-8 h-8 text-xs';
 
-  if (url && !failed) {
-    const source = String(url).startsWith('/api/') || /^https?:/i.test(String(url))
-      ? String(url)
-      : `/api/avatars/${String(url)}`;
+  const resolvedSource = resolveRenderableAvatarUrl(url);
+  if (resolvedSource && !failed) {
     return (
       <img
-        key={`${threadId || ''}:${source}`}
-        src={source}
+        key={`${threadId || ''}:${resolvedSource}`}
+        src={resolvedSource}
         alt=""
         className={`${sizeClass} rounded-full object-cover border border-[var(--color-border)] shadow-sm`}
         onError={() => setFailed(true)}
@@ -91,8 +90,11 @@ function renderRichContent(text) {
   return parts;
 }
 
-export default function MessageBubble({ msg, activeThread, onRetry, isLastSeenByCustomer = false }) {
+export default function MessageBubble({ msg: rawMsg, activeThread, onRetry, isLastSeenByCustomer = false }) {
   const [isTimePinned, setIsTimePinned] = useState(false);
+  const msg = (rawMsg && typeof rawMsg.message === 'object' && rawMsg.message !== null && rawMsg.content === undefined)
+    ? { ...rawMsg, ...rawMsg.message }
+    : (rawMsg || {});
   // is_outgoing flag la nguon chan ly chinh. sender_type 'staff'/'ai' chi la go y phu
   // - KHONG duoc dung standalone vi khach hang cung co the bi gan sender_type sai boi extension.
   const hasExplicitOutgoing = msg.is_outgoing === true || msg.is_outgoing === 1
@@ -107,7 +109,8 @@ export default function MessageBubble({ msg, activeThread, onRetry, isLastSeenBy
   const isPendingDirection = msg.direction_status === 'pending' && !isBoolOutgoing;
   const isOutgoing = isConfirmedOutgoing(msg) || Boolean(isBoolOutgoing);
   const isUnsent = Boolean(msg.is_unsent || msg.unsent);
-  const content = msg.content || msg.text_content || msg.text || msg.message || '';
+  const rawContent = msg.content ?? msg.text_content ?? msg.text ?? (typeof msg.message === 'string' ? msg.message : '');
+  const content = typeof rawContent === 'string' ? rawContent : String(rawContent || '');
   const senderName = msg.sender_name || (isOutgoing ? (msg.is_ai || msg.sender_type === 'ai' ? 'AI' : 'Bạn') : activeThread?.contact_name || 'Khách hàng');
   // Persisted delivery_status is authoritative. A stale optimistic status can
   // remain 'pending' after the backend has confirmed the Messenger media.

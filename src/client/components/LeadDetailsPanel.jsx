@@ -46,6 +46,7 @@ import {
   areTagsEqual
 } from '../utils/tags.js';
 import { parseCustomFields, addCustomField, removeCustomField } from '../utils/customFields.js';
+import { resolveRenderableAvatarUrl } from '../utils/avatarUrl.js';
 
 const AVATAR_COLORS = ['#2684ff', '#a855f7', '#0fbd74', '#ec4899', '#ff6b2c', '#00b8a9', '#6366f1', '#ff3b4f'];
 
@@ -139,6 +140,10 @@ function ExportFooter({ onExportLeads }) {
 export default function LeadDetailsPanel({ contactInfo, onSaveContact, onExportLeads, onCloseDrawer, leadStatuses = [], onCreateLeadStatus, onDeleteLeadStatus, onSetReminder, onCompleteReminder, onCancelReminder, onArchiveThread }) {
   const [activeTab, setActiveTab] = useState('INFO');
   const [profileCopied, setProfileCopied] = useState(false);
+  const [avatarError, setAvatarError] = useState(false);
+  useEffect(() => {
+    setAvatarError(false);
+  }, [contactInfo?.thread_id, contactInfo?.avatar_url]);
   // Màu nhãn khách hàng (bảng lead_tags): map lowercase name -> hex
   const [tagColors, setTagColors] = useState({});
   const [colorPickerTag, setColorPickerTag] = useState(null);
@@ -796,11 +801,12 @@ export default function LeadDetailsPanel({ contactInfo, onSaveContact, onExportL
       {/* Avatar + name + chips, overlapping the banner */}
       <div className="relative px-4 pb-3 -mt-8 text-center shrink-0">
         <div className="inline-block p-1 bg-[var(--color-bg-panel)] rounded-full shadow-lg">
-          {contactInfo.avatar_url ? (
+          {resolveRenderableAvatarUrl(contactInfo.avatar_url) && !avatarError ? (
             <img
-              src={String(contactInfo.avatar_url).startsWith('http') ? contactInfo.avatar_url : `/api/avatars/${contactInfo.avatar_url}`}
+              src={resolveRenderableAvatarUrl(contactInfo.avatar_url)}
               alt=""
               className="w-14 h-14 rounded-full object-cover"
+              onError={() => setAvatarError(true)}
             />
           ) : (
             <div

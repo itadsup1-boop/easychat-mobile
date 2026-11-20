@@ -3,6 +3,7 @@ import { BellRing, BellOff, Clock3, Archive, Check, Mail, MailOpen, Pin, PinOff,
 import { getStatusBadgeStyle } from '../utils/color.js';
 import { getReminderDueAriaLabel, getReminderDueState, reminderBellKey } from '../utils/reminderPresentation.js';
 import { isThreadActiveToday, normalizeThreadTimestamp } from '../utils/threadActivity.js';
+import { resolveRenderableAvatarUrl } from '../utils/avatarUrl.js';
 
 const AVATAR_COLORS = ['#2684ff', '#a855f7', '#0fbd74', '#ec4899', '#ff6b2c', '#00b8a9', '#6366f1', '#ff3b4f', '#f5b51b', '#06b6d4'];
 
@@ -21,6 +22,9 @@ function formatTime(value) {
 
 function ConversationItem({ thread, isSelected, onSelect, accounts = [], inboxSources = [], selectionMode = false, isChecked = false, onToggle, onToggleUnread, onTogglePin, reminderBellMuted, onToggleReminderBell, onCompleteReminder, onCancelReminder }) {
   const [avatarError, setAvatarError] = React.useState(false);
+  React.useEffect(() => {
+    setAvatarError(false);
+  }, [thread.id, thread.avatar_url]);
   const account = accounts.find((item) => String(item.id) === String(thread.account_id));
   const source = inboxSources.find((item) => String(item.id) === String(thread.source_id));
   const isOnline = account ? account.is_extension_connected !== false : true;
@@ -93,7 +97,11 @@ function ConversationItem({ thread, isSelected, onSelect, accounts = [], inboxSo
   const accountColor = pickAvatarColor(thread.account_id || thread.source_id || sourceName);
   const senderAccountId = sourceType === 'page_messenger' ? (source?.external_id || thread.source_external_id || thread.source_id) : thread.account_id;
   const senderAccountSuffix = String(senderAccountId || '').slice(-4);
-  const senderAccountAvatarUrl = sourceType === 'page_messenger' ? source?.avatar_url : (account?.avatar_url || source?.avatar_url);
+  const senderAccountAvatarUrl = resolveRenderableAvatarUrl(
+    sourceType === 'page_messenger' ? source?.avatar_url : (account?.avatar_url || source?.avatar_url),
+    { allowGraphPsidPicture: true }
+  );
+  const resolvedAvatarUrl = resolveRenderableAvatarUrl(thread.avatar_url);
   const sourceClass = sourceType === 'page_messenger'
     ? 'bg-violet-500/10 text-violet-500 border border-violet-500/20'
     : 'bg-sky-500/10 text-sky-500 border border-sky-500/20';
@@ -135,8 +143,8 @@ function ConversationItem({ thread, isSelected, onSelect, accounts = [], inboxSo
         </span>
       )}
       <div className="relative flex-shrink-0">
-        {thread.avatar_url && !avatarError ? (
-          <img src={String(thread.avatar_url).startsWith('http') ? thread.avatar_url : '/api/avatars/' + thread.avatar_url} alt="" className="w-11 h-11 rounded-full object-cover border border-[var(--color-border)] shadow-sm" onError={() => setAvatarError(true)} />
+        {resolvedAvatarUrl && !avatarError ? (
+          <img src={resolvedAvatarUrl} alt="" className="w-11 h-11 rounded-full object-cover border border-[var(--color-border)] shadow-sm" onError={() => setAvatarError(true)} />
         ) : (
           <div className="w-11 h-11 rounded-full flex items-center justify-center text-[var(--color-text-on-accent)] font-semibold text-sm shadow-sm" style={{ backgroundColor: avatarColor }}>
             {title.charAt(0).toUpperCase()}

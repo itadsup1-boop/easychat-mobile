@@ -15,6 +15,7 @@ import {
   RefreshCw,
   MoreVertical
 } from 'lucide-react';
+import { resolveRenderableAvatarUrl } from '../utils/avatarUrl.js';
 
 const AVATAR_COLORS = ['#2684ff', '#a855f7', '#0fbd74', '#ec4899', '#ff6b2c', '#00b8a9', '#6366f1', '#ff3b4f'];
 
@@ -47,8 +48,14 @@ export default function ChatHeader({
   showBackButton = false,
   onGoBack
 }) {
-  if (!activeThread) return null;
   const [avatarError, setAvatarError] = React.useState(false);
+  const [chromeToggling, setChromeToggling] = React.useState(false);
+  const [moreMenuOpen, setMoreMenuOpen] = React.useState(false);
+  React.useEffect(() => {
+    setAvatarError(false);
+  }, [activeThread?.id, activeThread?.avatar_url]);
+
+  if (!activeThread) return null;
 
   const isAiPaused = activeThread.ai_paused_until && new Date(activeThread.ai_paused_until) > new Date();
   const account = accounts.find((item) => String(item.id) === String(activeThread.account_id));
@@ -59,7 +66,11 @@ export default function ChatHeader({
   const senderAccountName = sourceType === 'page_messenger' ? sourceName : accountName;
   const senderAccountId = sourceType === 'page_messenger' ? (source?.external_id || activeThread.source_external_id || activeThread.source_id) : activeThread.account_id;
   const senderAccountSuffix = String(senderAccountId || '').slice(-4);
-  const senderAvatarUrl = sourceType === 'page_messenger' ? source?.avatar_url : (account?.avatar_url || source?.avatar_url);
+  const senderAvatarUrl = resolveRenderableAvatarUrl(
+    sourceType === 'page_messenger' ? source?.avatar_url : (account?.avatar_url || source?.avatar_url),
+    { allowGraphPsidPicture: true }
+  );
+  const resolvedAvatarUrl = resolveRenderableAvatarUrl(activeThread.avatar_url);
   const sourceLabel = sourceType === 'page_messenger' ? `Gửi bằng Page: ${senderAccountName}` : `Gửi bằng: ${senderAccountName}`;
   const sourceStatus = activeThread.source_status || source?.status || 'ACTIVE';
   const isExtConnected = sourceType === 'page_messenger' ? sourceStatus === 'ACTIVE' : (account ? account.is_extension_connected !== false : true);
@@ -72,8 +83,6 @@ export default function ChatHeader({
   const messengerUrl = sourceType === 'page_messenger'
     ? (activeThread.profile_url || null)
     : (activeThread.thread_url || `https://facebook.com/messages/t/${activeThread.external_thread_id || activeThread.id}`);
-  const [chromeToggling, setChromeToggling] = React.useState(false);
-  const [moreMenuOpen, setMoreMenuOpen] = React.useState(false);
   const isChromeRunning = account?.is_chrome_running === true;
   const isChromeHidden = account?.chrome_display_mode === 'BACKGROUND';
 
@@ -115,9 +124,9 @@ export default function ChatHeader({
         )}
 
         <div className="relative shrink-0">
-          {activeThread.avatar_url && !avatarError ? (
+          {resolvedAvatarUrl && !avatarError ? (
             <img
-              src={String(activeThread.avatar_url).startsWith('http') ? activeThread.avatar_url : `/api/avatars/${activeThread.avatar_url}`}
+              src={resolvedAvatarUrl}
               alt=""
               className="w-11 h-11 rounded-full object-cover border border-[var(--color-border)] shadow-sm"
               onError={() => setAvatarError(true)}
