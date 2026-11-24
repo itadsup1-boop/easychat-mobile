@@ -148,7 +148,64 @@ export default function AuthScreen({ onAuthenticated }) {
     Boolean(window.electronAPI)
   );
 
+  const mobileGooglePollRef = useRef(null);
+
+  const stopMobileGooglePolling = () => {
+    if (mobileGooglePollRef.current) {
+      clearInterval(mobileGooglePollRef.current.timer);
+      if (mobileGooglePollRef.current.onVis) {
+        document.removeEventListener('visibilitychange', mobileGooglePollRef.current.onVis);
+      }
+      mobileGooglePollRef.current = null;
+    }
+  };
+
+  useEffect(() => () => stopMobileGooglePolling(), []);
+
   const handleExternalGoogleLogin = () => {
+    if (mobile) {
+      stopMobileGooglePolling();
+      setError('');
+      const sessionId = 'mg_' + Date.now() + '_' + Math.random().toString(36).slice(2, 10);
+      const authUrl = `${LICENSE_SERVER_BASE}/api/client-auth/google-mobile-page?session=${encodeURIComponent(sessionId)}`;
+      setSuccessMsg('Đã mở trình duyệt để đăng nhập Google. Xác nhận xong hãy quay lại EasyChat...');
+      try {
+        window.open(authUrl, '_blank', 'noopener,noreferrer');
+      } catch (_) {
+        window.location.href = authUrl;
+      }
+
+      const startedAt = Date.now();
+      const checkStatus = async () => {
+        if (Date.now() - startedAt > 3 * 60 * 1000) {
+          stopMobileGooglePolling();
+          return;
+        }
+        try {
+          const nativeFetch = window._easychatNativeFetch || window.fetch;
+          const resp = await nativeFetch(`${LICENSE_SERVER_BASE}/api/client-auth/google-mobile-status?session=${encodeURIComponent(sessionId)}`);
+          const data = await resp.json().catch(() => ({}));
+          if (data?.status === 'completed' && data?.user) {
+            stopMobileGooglePolling();
+            setSuccessMsg('');
+            setSavedMobileUser(data.user);
+            onAuthenticated(data.user);
+          } else if (data?.status === 'error') {
+            stopMobileGooglePolling();
+            setSuccessMsg('');
+            setError(data.message || 'Không thể đăng nhập bằng Google.');
+          }
+        } catch (_) {}
+      };
+
+      const onVis = () => {
+        if (document.visibilityState === 'visible') checkStatus();
+      };
+      document.addEventListener('visibilitychange', onVis);
+      const timer = setInterval(checkStatus, 1500);
+      mobileGooglePollRef.current = { timer, onVis };
+      return;
+    }
     const url = `${window.location.origin}/google-auth-external`;
     window.open(url, '_blank');
   };
@@ -211,7 +268,7 @@ export default function AuthScreen({ onAuthenticated }) {
   }, [onAuthenticated, mobile]);
 
   useEffect(() => {
-    if (mode === 'forgot' || isElectron) return;
+    if (mode === 'forgot' || isElectron || mobile) return;
     let cancelled = false;
     let retryTimer = null;
     const renderGoogleButton = () => {
@@ -477,7 +534,7 @@ export default function AuthScreen({ onAuthenticated }) {
                     <span className="text-sm text-slate-500">hoặc</span>
                     <div className="h-px flex-1 bg-slate-200" />
                   </div>
-                  {isElectron ? (
+                  {(isElectron || mobile) ? (
                     <button
                       type="button"
                       onClick={handleExternalGoogleLogin}
