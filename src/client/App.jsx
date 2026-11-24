@@ -2423,7 +2423,7 @@ export default function App() {
           onDismiss={() => setLicenseBannerDismissed(true)}
         />
       )}
-      <SupportTelegramButton />
+      <SupportTelegramButton hiddenOnMobile={Boolean(activeThreadId) || Boolean(activeModal)} />
       {/* Column 1: Sidebar Navigation - 48px */}
       <AppSidebar
         activeView={activeView}

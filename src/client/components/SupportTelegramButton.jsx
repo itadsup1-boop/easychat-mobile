@@ -4,8 +4,12 @@ import { createPortal } from 'react-dom';
 
 const QR_URL = '/images/telegram-support-qr-clean.png?v=1.0.33';
 
-export default function SupportTelegramButton() {
+export default function SupportTelegramButton({ hiddenOnMobile = false }) {
   const [open, setOpen] = useState(false);
+
+  useEffect(() => {
+    if (hiddenOnMobile && open) setOpen(false);
+  }, [hiddenOnMobile, open]);
 
   useEffect(() => {
     if (!open) return undefined;
@@ -40,7 +44,7 @@ export default function SupportTelegramButton() {
           animation: crmTelegramRipple 2.2s cubic-bezier(0, 0, 0.2, 1) 1.1s infinite;
         }
       `}</style>
-      <div className="fixed bottom-4 right-4 z-[80] flex items-center justify-center">
+      <div className={`fixed bottom-24 right-4 md:bottom-4 z-[80] items-center justify-center ${hiddenOnMobile ? 'hidden md:flex' : 'flex'}`}>
         <span
           aria-hidden="true"
           className="crm-tg-ripple-1 pointer-events-none absolute inset-0 rounded-full bg-[#229ED9]/65 ring-2 ring-[#38bdf8]/70"
@@ -68,7 +72,7 @@ export default function SupportTelegramButton() {
           <div
             role="dialog"
             aria-label="Hỗ trợ qua Telegram"
-            className="fixed bottom-16 right-4 z-[9995] w-64 rounded-2xl border border-black/10 bg-white p-4 shadow-2xl dark:border-white/10 dark:bg-slate-900"
+            className="fixed bottom-36 right-4 md:bottom-16 z-[9995] w-64 rounded-2xl border border-black/10 bg-white p-4 shadow-2xl dark:border-white/10 dark:bg-slate-900"
           >
             <div className="mb-2 flex items-center justify-between">
               <p className="text-sm font-semibold text-slate-800 dark:text-slate-100">Hỗ trợ EasyChat</p>
