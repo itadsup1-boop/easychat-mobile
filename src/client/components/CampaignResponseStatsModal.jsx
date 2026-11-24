@@ -119,8 +119,8 @@ export default function CampaignResponseStatsModal({ campaignId, campaignName, o
               </div>
 
               <div className="mt-3 grid grid-cols-2 gap-3">
-                <div className="rounded-xl bg-emerald-50 px-4 py-3"><p className="text-xs text-emerald-700">Tỷ lệ phản hồi</p><p className="mt-1 text-xl font-bold text-emerald-700">{data.rates.reply_rate}%</p></div>
-                <div className="rounded-xl bg-purple-50 px-4 py-3"><p className="text-xs text-purple-700">Tỷ lệ thu SĐT</p><p className="mt-1 text-xl font-bold text-purple-700">{data.rates.phone_rate}%</p></div>
+                <div className="rounded-xl bg-emerald-50 px-4 py-3"><p className="text-xs text-emerald-700">Tỷ lệ phản hồi</p><p className="mt-1 text-xl font-bold text-emerald-700">{data?.rates?.reply_rate ?? 0}%</p></div>
+                <div className="rounded-xl bg-purple-50 px-4 py-3"><p className="text-xs text-purple-700">Tỷ lệ thu SĐT</p><p className="mt-1 text-xl font-bold text-purple-700">{data?.rates?.phone_rate ?? 0}%</p></div>
               </div>
 
               <div className="mt-5 flex flex-wrap gap-2 border-b border-slate-200 pb-3">

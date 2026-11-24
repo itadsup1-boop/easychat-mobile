@@ -1896,6 +1896,7 @@ export async function handleMobileStandaloneApi(nativeFetch, urlStr, input, init
       const sentMs = Date.parse(r.sent_at || '') || 0;
       const threadMsgs = store.messagesByThread[r.thread_id] || [];
       const customerReplies = threadMsgs.filter((m) => !m.is_outgoing && (Number(m.timestamp_ms) || Date.parse(m.created_at || '') || 0) > sentMs);
+      const firstReply = customerReplies[0] || null;
       const contact = store.contactsByThread[r.thread_id] || {};
       const phone = contact.phone || customerReplies.map((m) => extractPhoneFromText(m.content)).find(Boolean) || null;
       return {
@@ -1906,22 +1907,33 @@ export async function handleMobileStandaloneApi(nativeFetch, urlStr, input, init
         sent_at: r.sent_at,
         replied: customerReplies.length > 0,
         reply_count: customerReplies.length,
+        reply_preview: firstReply ? (firstReply.content || (firstReply.media_type === 'video' ? '[Video]' : '[Ảnh]')) : null,
+        replied_at: firstReply?.created_at || null,
         last_reply_at: customerReplies.length ? customerReplies[customerReplies.length - 1].created_at : null,
         last_reply_text: customerReplies.length ? customerReplies[customerReplies.length - 1].content : null,
         has_phone: Boolean(phone),
-        phone
+        phone,
+        phone_captured_at: contact.phone_captured_at || (phone ? firstReply?.created_at || null : null)
       };
     });
     const replied = items.filter((i) => i.replied);
     const withPhone = items.filter((i) => i.has_phone);
     const unanswered = items.filter((i) => !i.replied);
+    const sentCount = sentRecipients.length;
+    const replyRate = sentCount > 0 ? Math.round((replied.length / sentCount) * 1000) / 10 : 0;
+    const phoneRate = sentCount > 0 ? Math.round((withPhone.length / sentCount) * 1000) / 10 : 0;
     return jsonResponse({
       campaign_id: camp.id,
       counts: {
-        sent: sentRecipients.length,
+        sent: sentCount,
         replied: replied.length,
+        with_phone: withPhone.length,
         phone: withPhone.length,
         unanswered: unanswered.length
+      },
+      rates: {
+        reply_rate: replyRate,
+        phone_rate: phoneRate
       },
       recipients: items,
       replied,
