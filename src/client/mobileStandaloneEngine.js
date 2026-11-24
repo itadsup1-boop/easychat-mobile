@@ -1741,28 +1741,255 @@ export async function handleMobileStandaloneApi(nativeFetch, urlStr, input, init
   }
 
   // 11. Campaigns, AI Config, Phone Automation, Employees, Search
+  if (pathname === '/api/campaigns/config' && method === 'GET') {
+    return jsonResponse({
+      enabled: true,
+      max_recipients: 500,
+      min_pacing_ms: 500,
+      default_pacing_ms: 2000,
+      max_retries: 3
+    });
+  }
   if (pathname === '/api/campaigns') {
-    if (method === 'GET') return jsonResponse({ success: true, campaigns: store.campaigns, items: store.campaigns });
+    if (method === 'GET') {
+      const limit = Number(parsedUrl.searchParams.get('limit') || 50);
+      const list = store.campaigns.map((c) => recomputeMobileCampaignCounts(c)).slice(0, limit);
+      return jsonResponse(list);
+    }
     if (method === 'POST') {
       const body = await parseRequestBody(input, init);
-      const camp = {
-        id: 'camp_' + Date.now(),
-        name: body.name || 'Chiến dịch Fanpage',
-        message_template: body.message_template || body.content || '',
-        status: 'COMPLETED',
-        total_recipients: (body.thread_ids || []).length,
-        sent_count: (body.thread_ids || []).length,
-        created_at: new Date().toISOString()
-      };
+      const nowIso = new Date().toISOString();
+      const rawMessages = Array.isArray(body.messages) && body.messages.length
+        ? body.messages
+        : [{ text_content: body.message_template || body.content || '' }];
+      const messages = rawMessages.map((m, idx) => ({
+        id: `cmsg_${Date.now()}_${idx}`,
+        position: idx + 1,
+        text_content: String(m?.text_content ?? m?.content ?? '').trim(),
+        attachments: []
+      }));
+      const threadIds = Array.isArray(body.thread_ids) ? body.thread_ids : [];
+      const recipients = threadIds.map((tid, idx) => {
+        const thread = store.threads.find((t) => String(t.id) === String(tid));
+        const sourceType = thread?.source_type || 'page_messenger';
+        const isPage = sourceType === 'page_messenger';
+        return {
+          id: `crec_${Date.now()}_${idx}`,
+          position: idx + 1,
+          thread_id: String(tid),
+          contact_name: thread?.nickname || thread?.contact_name || thread?.name || String(tid),
+          source_type: sourceType,
+          source_id: thread?.source_id || null,
+          source_name: thread?.source_name || '',
+          account_id: thread?.account_id || null,
+          eligible: isPage,
+          status: isPage ? 'pending' : 'skipped',
+          error_message: isPage ? null : 'Mobile hiện chỉ hỗ trợ gửi chiến dịch qua Fanpage.',
+          attempts: 0,
+          sent_at: null
+        };
+      });
+      const camp = recomputeMobileCampaignCounts({
+        id: 'camp_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
+        name: String(body.name || 'Chiến dịch Fanpage').trim(),
+        status: 'ready',
+        messages,
+        recipients,
+        start_position: Math.max(1, Number(body.start_position || 1)),
+        direction: body.direction === 'backward' ? 'backward' : 'forward',
+        pacing_ms: Math.max(500, Number(body.pacing_ms || 2000)),
+        max_retries: Math.max(0, Number(body.max_retries ?? 1)),
+        send_cap: Math.max(1, Number(body.send_cap || recipients.length || 1)),
+        phone_capture_policy: body.phone_capture_policy || 'continue',
+        phone_capture_thank_you_text: body.phone_capture_thank_you_text || null,
+        phone_capture_status_id: body.phone_capture_status_id || null,
+        audit: [{ id: `aud_${Date.now()}`, action: 'created', message: 'Đã tạo chiến dịch trên Mobile', created_at: nowIso }],
+        created_at: nowIso,
+        updated_at: nowIso
+      });
       store.campaigns.unshift(camp);
       saveStore();
-      for (const tid of (body.thread_ids || [])) {
-        sendPageMessageOnMobile(nativeFetch, {
-          threadId: tid,
-          content: camp.message_template
-        }).catch(() => {});
+      return jsonResponse(camp, 201);
+    }
+  }
+  const campaignAttachmentDeleteMatch = pathname.match(/^\/api\/campaigns\/([^/]+)\/attachments\/([^/]+)$/);
+  if (campaignAttachmentDeleteMatch && method === 'DELETE') {
+    const campId = decodeURIComponent(campaignAttachmentDeleteMatch[1]);
+    const attId = decodeURIComponent(campaignAttachmentDeleteMatch[2]);
+    const camp = store.campaigns.find((c) => String(c.id) === campId);
+    if (!camp) return jsonResponse({ error: { message: 'Không tìm thấy campaign.' } }, 404);
+    for (const m of (camp.messages || [])) {
+      m.attachments = (m.attachments || []).filter((a) => String(a.id) !== attId);
+    }
+    stagedFiles.delete(attId);
+    camp.updated_at = new Date().toISOString();
+    saveStore();
+    return jsonResponse({ success: true, campaign: recomputeMobileCampaignCounts(camp) });
+  }
+  const campaignAttachmentsMatch = pathname.match(/^\/api\/campaigns\/([^/]+)\/attachments$/);
+  if (campaignAttachmentsMatch && method === 'POST') {
+    const campId = decodeURIComponent(campaignAttachmentsMatch[1]);
+    const camp = store.campaigns.find((c) => String(c.id) === campId);
+    if (!camp) return jsonResponse({ error: { message: 'Không tìm thấy campaign.' } }, 404);
+    const form = await parseRequestBody(input, init);
+    const msgId = form instanceof FormData ? String(form.get('campaign_message_id') || '') : '';
+    const files = form instanceof FormData
+      ? [...form.getAll('files'), ...(form.get('file') ? [form.get('file')] : [])].filter(Boolean)
+      : [];
+    const targetMsg = (camp.messages || []).find((m) => String(m.id) === msgId) || camp.messages?.[0];
+    if (!targetMsg || !files.length) {
+      return jsonResponse({ error: { message: 'Không tìm thấy tệp đính kèm hợp lệ.' } }, 400);
+    }
+    if (!Array.isArray(targetMsg.attachments)) targetMsg.attachments = [];
+    for (const file of files) {
+      const id = 'catt_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6);
+      const mime = String(file.type || '');
+      const mediaType = mime.startsWith('video/') ? 'video' : (mime.startsWith('image/') ? 'image' : 'file');
+      const previewUrl = URL.createObjectURL(file);
+      stagedFiles.set(id, {
+        id,
+        attachment_id: id,
+        file,
+        preview_url: previewUrl,
+        media_url: previewUrl,
+        media_type: mediaType,
+        name: file.name || 'attachment',
+        size: file.size || 0,
+        mime_type: mime
+      });
+      targetMsg.attachments.push({
+        id,
+        original_name: file.name || 'attachment',
+        safe_name: file.name || 'attachment',
+        media_type: mediaType,
+        mime_type: mime,
+        byte_size: file.size || 0,
+        preview_url: previewUrl,
+        url: previewUrl
+      });
+    }
+    camp.updated_at = new Date().toISOString();
+    saveStore();
+    return jsonResponse({ success: true, campaign: recomputeMobileCampaignCounts(camp) });
+  }
+  const campaignRetryRecipientMatch = pathname.match(/^\/api\/campaigns\/([^/]+)\/recipients\/([^/]+)\/retry$/);
+  if (campaignRetryRecipientMatch && method === 'POST') {
+    const campId = decodeURIComponent(campaignRetryRecipientMatch[1]);
+    const recId = decodeURIComponent(campaignRetryRecipientMatch[2]);
+    const camp = store.campaigns.find((c) => String(c.id) === campId);
+    if (!camp) return jsonResponse({ error: { message: 'Không tìm thấy campaign.' } }, 404);
+    const rec = (camp.recipients || []).find((r) => String(r.id) === recId);
+    if (!rec) return jsonResponse({ error: { message: 'Không tìm thấy người nhận.' } }, 404);
+    await sendMobileCampaignToRecipient(nativeFetch, camp, rec);
+    recomputeMobileCampaignCounts(camp);
+    saveStore();
+    broadcastMobileSocket('CAMPAIGN_UPDATED', { campaign_id: camp.id });
+    return jsonResponse(camp);
+  }
+  const campaignResponseStatsMatch = pathname.match(/^\/api\/campaigns\/([^/]+)\/response-stats$/);
+  if (campaignResponseStatsMatch && method === 'GET') {
+    const campId = decodeURIComponent(campaignResponseStatsMatch[1]);
+    const camp = store.campaigns.find((c) => String(c.id) === campId);
+    if (!camp) return jsonResponse({ error: { message: 'Không tìm thấy campaign.' } }, 404);
+    const sentRecipients = (camp.recipients || []).filter((r) => r.status === 'sent');
+    const items = sentRecipients.map((r) => {
+      const sentMs = Date.parse(r.sent_at || '') || 0;
+      const threadMsgs = store.messagesByThread[r.thread_id] || [];
+      const customerReplies = threadMsgs.filter((m) => !m.is_outgoing && (Number(m.timestamp_ms) || Date.parse(m.created_at || '') || 0) > sentMs);
+      const contact = store.contactsByThread[r.thread_id] || {};
+      const phone = contact.phone || customerReplies.map((m) => extractPhoneFromText(m.content)).find(Boolean) || null;
+      return {
+        recipient_id: r.id,
+        thread_id: r.thread_id,
+        contact_name: r.contact_name,
+        source_name: r.source_name,
+        sent_at: r.sent_at,
+        replied: customerReplies.length > 0,
+        reply_count: customerReplies.length,
+        last_reply_at: customerReplies.length ? customerReplies[customerReplies.length - 1].created_at : null,
+        last_reply_text: customerReplies.length ? customerReplies[customerReplies.length - 1].content : null,
+        has_phone: Boolean(phone),
+        phone
+      };
+    });
+    const replied = items.filter((i) => i.replied);
+    const withPhone = items.filter((i) => i.has_phone);
+    const unanswered = items.filter((i) => !i.replied);
+    return jsonResponse({
+      campaign_id: camp.id,
+      counts: {
+        sent: sentRecipients.length,
+        replied: replied.length,
+        phone: withPhone.length,
+        unanswered: unanswered.length
+      },
+      recipients: items,
+      replied,
+      phone: withPhone,
+      unanswered
+    });
+  }
+  const campaignActionMatch = pathname.match(/^\/api\/campaigns\/([^/]+)\/(preview|start|resume|pause|cancel)$/);
+  if (campaignActionMatch && method === 'POST') {
+    const campId = decodeURIComponent(campaignActionMatch[1]);
+    const action = campaignActionMatch[2];
+    const camp = store.campaigns.find((c) => String(c.id) === campId);
+    if (!camp) return jsonResponse({ error: { message: 'Không tìm thấy campaign.' } }, 404);
+    const nowIso = new Date().toISOString();
+    if (!Array.isArray(camp.audit)) camp.audit = [];
+    if (action === 'preview') {
+      camp.status = 'ready';
+      camp.audit.push({ id: `aud_${Date.now()}`, action: 'preview', message: 'Đã kiểm tra hợp lệ — sẵn sàng gửi', created_at: nowIso });
+    } else if (action === 'pause') {
+      camp.status = 'paused';
+      camp.audit.push({ id: `aud_${Date.now()}`, action: 'pause', message: 'Đã tạm dừng chiến dịch', created_at: nowIso });
+    } else if (action === 'cancel') {
+      camp.status = 'cancelled';
+      for (const r of (camp.recipients || [])) {
+        if (r.status === 'pending' || r.status === 'processing') r.status = 'cancelled';
       }
-      return jsonResponse({ success: true, campaign: camp, data: camp });
+      camp.audit.push({ id: `aud_${Date.now()}`, action: 'cancel', message: 'Đã hủy chiến dịch', created_at: nowIso });
+    } else if (action === 'start' || action === 'resume') {
+      camp.status = 'running';
+      camp.audit.push({ id: `aud_${Date.now()}`, action, message: action === 'start' ? 'Bắt đầu chạy chiến dịch' : 'Tiếp tục chạy chiến dịch', created_at: nowIso });
+      runMobileCampaignLoop(nativeFetch, camp).catch(() => {});
+    }
+    camp.updated_at = nowIso;
+    recomputeMobileCampaignCounts(camp);
+    saveStore();
+    broadcastMobileSocket('CAMPAIGN_UPDATED', { campaign_id: camp.id });
+    return jsonResponse(camp);
+  }
+  const campaignByIdMatch = pathname.match(/^\/api\/campaigns\/([^/]+)$/);
+  if (campaignByIdMatch) {
+    const campId = decodeURIComponent(campaignByIdMatch[1]);
+    const camp = store.campaigns.find((c) => String(c.id) === campId);
+    if (!camp) return jsonResponse({ error: { message: 'Không tìm thấy campaign.' } }, 404);
+    if (method === 'GET') {
+      return jsonResponse(recomputeMobileCampaignCounts(camp));
+    }
+    if (method === 'PATCH' || method === 'PUT') {
+      const body = await parseRequestBody(input, init);
+      if (Array.isArray(body.messages)) {
+        camp.messages = body.messages.map((m, idx) => ({
+          id: camp.messages?.[idx]?.id || `cmsg_${Date.now()}_${idx}`,
+          position: idx + 1,
+          text_content: String(m?.text_content ?? m?.content ?? '').trim(),
+          attachments: camp.messages?.[idx]?.attachments || []
+        }));
+      }
+      if (body.start_position != null) camp.start_position = Math.max(1, Number(body.start_position));
+      if (body.direction) camp.direction = body.direction === 'backward' ? 'backward' : 'forward';
+      if (body.pacing_ms != null) camp.pacing_ms = Math.max(500, Number(body.pacing_ms));
+      if (body.max_retries != null) camp.max_retries = Math.max(0, Number(body.max_retries));
+      if (body.send_cap != null) camp.send_cap = Math.max(1, Number(body.send_cap));
+      if (body.phone_capture_policy) camp.phone_capture_policy = body.phone_capture_policy;
+      if (body.phone_capture_thank_you_text !== undefined) camp.phone_capture_thank_you_text = body.phone_capture_thank_you_text;
+      if (body.phone_capture_status_id !== undefined) camp.phone_capture_status_id = body.phone_capture_status_id;
+      camp.updated_at = new Date().toISOString();
+      recomputeMobileCampaignCounts(camp);
+      saveStore();
+      return jsonResponse(camp);
     }
   }
   if (pathname === '/api/ai-config') {
@@ -1833,4 +2060,105 @@ function upsertMobilePageSource({ pageId, name, avatarUrl, token }) {
   }
   saveStore();
   return nextSource;
+}
+
+const runningCampaignIds = new Set();
+
+function recomputeMobileCampaignCounts(camp) {
+  const recipients = Array.isArray(camp.recipients) ? camp.recipients : [];
+  const counts = {
+    total: recipients.length,
+    eligible: recipients.filter((r) => r.eligible !== false).length,
+    pending: recipients.filter((r) => r.status === 'pending').length,
+    processing: recipients.filter((r) => r.status === 'processing').length,
+    sent: recipients.filter((r) => r.status === 'sent').length,
+    failed: recipients.filter((r) => r.status === 'failed').length,
+    skipped: recipients.filter((r) => r.status === 'skipped').length,
+    cancelled: recipients.filter((r) => r.status === 'cancelled').length
+  };
+  const sourceCounts = {
+    page_messenger: recipients.filter((r) => r.source_type === 'page_messenger').length,
+    personal_messenger: recipients.filter((r) => r.source_type !== 'page_messenger').length
+  };
+  camp.counts = counts;
+  camp.source_counts = sourceCounts;
+  return camp;
+}
+
+async function sendMobileCampaignToRecipient(nativeFetch, camp, rec) {
+  rec.status = 'processing';
+  rec.attempts = Number(rec.attempts || 0) + 1;
+  rec.error_message = null;
+  recomputeMobileCampaignCounts(camp);
+  broadcastMobileSocket('CAMPAIGN_UPDATED', { campaign_id: camp.id });
+
+  try {
+    const msgs = Array.isArray(camp.messages) ? camp.messages : [];
+    for (const m of msgs) {
+      const text = String(m?.text_content || m?.content || '').trim();
+      const attIds = Array.isArray(m?.attachments) ? m.attachments.map((a) => a.id).filter(Boolean) : [];
+      if (!text && !attIds.length) continue;
+      await sendPageMessageOnMobile(nativeFetch, {
+        threadId: rec.thread_id,
+        content: text,
+        attachmentIds: attIds,
+        clientMessageId: `camp_${camp.id}_${rec.id}_${m.id || Date.now()}`
+      });
+    }
+    rec.status = 'sent';
+    rec.sent_at = new Date().toISOString();
+    rec.error_message = null;
+  } catch (err) {
+    rec.status = 'failed';
+    rec.error_message = err?.message || 'Gửi tin thất bại';
+  }
+}
+
+async function runMobileCampaignLoop(nativeFetch, camp) {
+  if (!camp || runningCampaignIds.has(camp.id)) return;
+  runningCampaignIds.add(camp.id);
+  try {
+    const allRecs = Array.isArray(camp.recipients) ? camp.recipients.slice() : [];
+    const startIdx = Math.max(0, (Number(camp.start_position || 1) - 1));
+    let ordered = camp.direction === 'backward'
+      ? allRecs.slice(0, startIdx + 1).reverse()
+      : allRecs.slice(startIdx);
+    const sendCap = Math.max(1, Number(camp.send_cap || ordered.length || 1));
+    let sentInRun = 0;
+
+    for (const rec of ordered) {
+      if (camp.status !== 'running') break;
+      if (rec.status !== 'pending') continue;
+      if (sentInRun >= sendCap) break;
+
+      await sendMobileCampaignToRecipient(nativeFetch, camp, rec);
+      sentInRun += 1;
+      recomputeMobileCampaignCounts(camp);
+      saveStore();
+      broadcastMobileSocket('CAMPAIGN_UPDATED', { campaign_id: camp.id });
+
+      if (camp.status !== 'running') break;
+      const pacingMs = Math.max(500, Number(camp.pacing_ms || 2000));
+      await new Promise((resolve) => setTimeout(resolve, pacingMs));
+    }
+
+    if (camp.status === 'running') {
+      recomputeMobileCampaignCounts(camp);
+      camp.status = camp.counts.failed > 0 && camp.counts.sent > 0
+        ? 'completed_with_errors'
+        : (camp.counts.failed > 0 && camp.counts.sent === 0 ? 'failed' : 'completed');
+      camp.updated_at = new Date().toISOString();
+      if (!Array.isArray(camp.audit)) camp.audit = [];
+      camp.audit.push({
+        id: `aud_${Date.now()}`,
+        action: camp.status,
+        message: `Hoàn tất: đã gửi ${camp.counts.sent}, lỗi ${camp.counts.failed}`,
+        created_at: camp.updated_at
+      });
+      saveStore();
+      broadcastMobileSocket('CAMPAIGN_UPDATED', { campaign_id: camp.id });
+    }
+  } finally {
+    runningCampaignIds.delete(camp.id);
+  }
 }
