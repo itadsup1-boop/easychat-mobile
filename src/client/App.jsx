@@ -1690,7 +1690,7 @@ export default function App() {
     });
 
     socket.on('CONTACT_UPDATED', (contactUpdate = {}) => {
-      const { thread_id, avatar_url, name, nickname, phone, email, status_id, status_name, status_color, phone_source, phone_captured_at, profile_url } = contactUpdate;
+      const { thread_id, avatar_url, name, nickname, phone, email, address, tags, status_id, status_name, status_color, phone_source, phone_captured_at, profile_url } = contactUpdate;
       if (thread_id == null) return;
       const tidStr = String(thread_id);
       const contactPatch = {
@@ -1698,8 +1698,10 @@ export default function App() {
         ...(profile_url ? { profile_url } : {}),
         ...(name ? { name } : {}),
         ...(nickname !== undefined ? { nickname } : {}),
-        ...(phone ? { phone } : {}),
-        ...(email ? { email } : {}),
+        ...(phone !== undefined ? { phone } : {}),
+        ...(email !== undefined ? { email } : {}),
+        ...(address !== undefined ? { address } : {}),
+        ...(tags !== undefined ? { tags } : {}),
         ...(status_id !== undefined ? { status_id, status_name: status_name || null, status_color: status_color || null } : {}),
         ...(phone_source !== undefined ? { phone_source } : {}),
         ...(phone_captured_at !== undefined ? { phone_captured_at } : {})
@@ -1710,6 +1712,10 @@ export default function App() {
         ...(profile_url ? { profile_url } : {}),
         ...(name ? { contact_name: name } : {}),
         ...(nickname !== undefined ? { nickname } : {}),
+        ...(phone !== undefined ? { phone } : {}),
+        ...(email !== undefined ? { email } : {}),
+        ...(address !== undefined ? { address } : {}),
+        ...(tags !== undefined ? { tags } : {}),
         ...(status_id !== undefined ? { status_id, status_name: status_name || null, status_color: status_color || null } : {})
       } : t));
       setContacts(prev => ({
@@ -2155,7 +2161,14 @@ export default function App() {
     );
     setContacts(prev => ({ ...prev, [contactThreadId]: persistedContact }));
     setThreads(prev => prev.map((thread) => String(thread.id) === contactThreadId
-      ? { ...thread, nickname: persistedContact.nickname || null }
+      ? {
+          ...thread,
+          nickname: persistedContact.nickname || null,
+          ...('tags' in persistedContact ? { tags: persistedContact.tags } : {}),
+          ...('phone' in persistedContact ? { phone: persistedContact.phone } : {}),
+          ...('email' in persistedContact ? { email: persistedContact.email } : {}),
+          ...('address' in persistedContact ? { address: persistedContact.address } : {})
+        }
       : thread));
     const verifiedName = getVerifiedContactName(persistedContact);
     if (verifiedName) {

@@ -119,14 +119,27 @@ function normalizeLoadedStore(data) {
     if (seenThreadIds.has(tid)) continue;
     seenThreadIds.add(tid);
     const pinnedVal = Number(rawThread.pinned ?? rawThread.is_pinned ?? 0) ? 1 : 0;
+    const contactRow = next.contactsByThread[tid] || {};
+    const statusId = rawThread.status_id ?? contactRow.status_id ?? rawThread.lead_status_id ?? contactRow.lead_status_id ?? null;
+    const matchedStatus = statusId != null
+      ? next.leadStatuses.find((s) => String(s.id) === String(statusId))
+      : null;
     dedupedThreads.push({
       ...rawThread,
       avatar_url: sanitizeMobileAvatarUrl(rawThread.avatar_url),
       pinned: pinnedVal,
-      is_pinned: pinnedVal
+      is_pinned: pinnedVal,
+      tags: rawThread.tags ?? contactRow.tags ?? '[]',
+      phone: rawThread.phone ?? contactRow.phone ?? null,
+      email: rawThread.email ?? contactRow.email ?? null,
+      address: rawThread.address ?? contactRow.address ?? null,
+      status_id: statusId,
+      status_name: rawThread.status_name ?? matchedStatus?.name ?? null,
+      status_color: rawThread.status_color ?? matchedStatus?.color ?? null
     });
   }
   next.threads = dedupedThreads;
+  next.leadTags = Array.isArray(data.leadTags) ? data.leadTags : [];
 
   for (const tid of Object.keys(next.contactsByThread)) {
     const c = next.contactsByThread[tid];
@@ -1663,16 +1676,68 @@ export async function handleMobileStandaloneApi(nativeFetch, urlStr, input, init
       const body = await parseRequestBody(input, init);
       const next = { ...(store.contactsByThread[tid] || { thread_id: tid }), ...body, thread_id: tid };
       store.contactsByThread[tid] = next;
+      const nextStatusId = next.status_id !== undefined ? next.status_id : next.lead_status_id;
+      const matchedStatus = nextStatusId != null
+        ? store.leadStatuses.find((s) => String(s.id) === String(nextStatusId))
+        : null;
       store.threads = store.threads.map((t) => (String(t.id) === tid ? {
         ...t,
         nickname: next.nickname ?? t.nickname,
         phone: next.phone ?? t.phone,
+        email: next.email ?? t.email,
+        address: next.address ?? t.address,
+        tags: next.tags !== undefined ? next.tags : t.tags,
         is_vip: next.is_vip ?? t.is_vip,
-        lead_status_id: next.lead_status_id ?? t.lead_status_id
+        lead_status_id: nextStatusId !== undefined ? nextStatusId : t.lead_status_id,
+        status_id: nextStatusId !== undefined ? nextStatusId : t.status_id,
+        status_name: nextStatusId !== undefined ? (matchedStatus?.name ?? null) : t.status_name,
+        status_color: nextStatusId !== undefined ? (matchedStatus?.color ?? null) : t.status_color
       } : t));
       saveStore();
+      broadcastMobileSocket('CONTACT_UPDATED', {
+        thread_id: tid,
+        nickname: next.nickname,
+        phone: next.phone,
+        email: next.email,
+        address: next.address,
+        tags: next.tags,
+        ...(nextStatusId !== undefined ? {
+          status_id: nextStatusId,
+          status_name: matchedStatus?.name ?? null,
+          status_color: matchedStatus?.color ?? null
+        } : {})
+      });
       return jsonResponse({ success: true, contact: next });
     }
+  }
+  if (pathname === '/api/lead-tags') {
+    if (!Array.isArray(store.leadTags)) store.leadTags = [];
+    if (method === 'GET') return jsonResponse(store.leadTags);
+    if (method === 'POST') {
+      const body = await parseRequestBody(input, init);
+      const name = String(body.name || '').trim().slice(0, 50);
+      if (!name) return jsonResponse({ error: 'Tên nhãn không được để trống.' }, 400);
+      const color = /^#[0-9a-fA-F]{6}$/.test(String(body.color || '')) ? body.color : '#6366F1';
+      const textColor = /^#[0-9a-fA-F]{6}$/.test(String(body.text_color || '')) ? body.text_color : '#FFFFFF';
+      const existing = store.leadTags.find((t) => String(t.name || '').toLowerCase() === name.toLowerCase());
+      if (existing) {
+        existing.color = color;
+        existing.text_color = textColor;
+        saveStore();
+        return jsonResponse({ success: true, tag: existing, ...existing });
+      }
+      const created = { id: Date.now(), name, color, text_color: textColor };
+      store.leadTags.push(created);
+      saveStore();
+      return jsonResponse({ success: true, tag: created, ...created });
+    }
+  }
+  const leadTagDelMatch = pathname.match(/^\/api\/lead-tags\/([^/]+)$/);
+  if (leadTagDelMatch && method === 'DELETE') {
+    const id = decodeURIComponent(leadTagDelMatch[1]);
+    store.leadTags = (store.leadTags || []).filter((t) => String(t.id) !== id && String(t.name).toLowerCase() !== id.toLowerCase());
+    saveStore();
+    return jsonResponse({ success: true });
   }
   if (pathname === '/api/lead-statuses') {
     if (method === 'GET') return jsonResponse(store.leadStatuses);
