@@ -217,7 +217,7 @@ function matchesArchiveScope(thread, scope, now) {
 }
 function matchesActivity(thread, range, now) {
   if (range.type === 'all') return true;
-  const timestamp = parseTime(thread?.last_activity);
+  const timestamp = parseTime(thread?.last_activity) ?? (Number.isFinite(Number(thread?.last_msg_ts)) && Number(thread?.last_msg_ts) > 0 ? Number(thread.last_msg_ts) : null);
   if (timestamp == null) return false;
   if (range.type === 'today') return isSameLocalDay(timestamp, now);
   if (range.type === 'last7') return timestamp >= now - 7 * 24 * 60 * 60 * 1000;
@@ -230,7 +230,7 @@ function matchesRule(thread, rule, now) {
   const tags = parseTags(thread?.tags);
   if (rule.field === 'tag') { const has = tags.includes(rule.value); return rule.operator === 'has' ? has : !has; }
   if (rule.field === 'contact') { const has = hasContactField(thread, rule.value); return rule.operator === 'has' ? has : !has; }
-  if (rule.field === 'activity') { const time = parseTime(thread?.last_activity); if (time == null) return false; if (rule.operator === 'before') return time < parseTime(rule.value + 'T00:00:00'); if (rule.operator === 'after') return time >= parseTime(rule.value + 'T00:00:00'); return matchesActivity(thread, { type: 'range', ...rule.value }, now); }
+  if (rule.field === 'activity') { const time = parseTime(thread?.last_activity) ?? (Number.isFinite(Number(thread?.last_msg_ts)) && Number(thread?.last_msg_ts) > 0 ? Number(thread.last_msg_ts) : null); if (time == null) return false; if (rule.operator === 'before') return time < parseTime(rule.value + 'T00:00:00'); if (rule.operator === 'after') return time >= parseTime(rule.value + 'T00:00:00'); return matchesActivity(thread, { type: 'range', ...rule.value }, now); }
   if (rule.field === 'reminder') return matchesReminderState(thread, rule.value, now);
   if (rule.field === 'archive') return matchesArchiveScope(thread, rule.value, now);
   return true;

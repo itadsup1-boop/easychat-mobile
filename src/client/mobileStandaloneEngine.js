@@ -1519,7 +1519,41 @@ export async function handleMobileStandaloneApi(nativeFetch, urlStr, input, init
     return jsonResponse({ count: 0 });
   }
   if (pathname === '/api/threads/active-on') {
-    return jsonResponse({ success: true, thread_ids: store.threads.map((t) => t.id) });
+    const fromStr = String(parsedUrl.searchParams.get('from') || '').trim();
+    const toStr = String(parsedUrl.searchParams.get('to') || '').trim();
+    const parseLocalDayBound = (dayStr, isEnd) => {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(dayStr)) return null;
+      const [y, m, d] = dayStr.split('-').map(Number);
+      const dt = isEnd ? new Date(y, m - 1, d, 23, 59, 59, 999) : new Date(y, m - 1, d, 0, 0, 0, 0);
+      return Number.isNaN(dt.getTime()) ? null : dt.getTime();
+    };
+    const fromMs = parseLocalDayBound(fromStr, false);
+    const toMs = parseLocalDayBound(toStr, true);
+    if (fromMs == null && toMs == null) {
+      return jsonResponse({ success: true, thread_ids: store.threads.map((t) => t.id) });
+    }
+    const inRange = (ts) => {
+      if (!Number.isFinite(ts) || ts <= 0) return false;
+      if (fromMs != null && ts < fromMs) return false;
+      if (toMs != null && ts > toMs) return false;
+      return true;
+    };
+    const matchedIds = [];
+    for (const t of store.threads) {
+      const tid = String(t.id);
+      const msgs = store.messagesByThread[tid];
+      if (Array.isArray(msgs) && msgs.length > 0) {
+        const hasMsgInRange = msgs.some((m) => {
+          const ts = Number(m?.timestamp_ms) || Date.parse(m?.created_at || '') || 0;
+          return inRange(ts);
+        });
+        if (hasMsgInRange) matchedIds.push(t.id);
+      } else {
+        const ts = Number(t.last_msg_ts) || Date.parse(t.last_activity || '') || 0;
+        if (inRange(ts)) matchedIds.push(t.id);
+      }
+    }
+    return jsonResponse({ success: true, thread_ids: matchedIds });
   }
   const threadMessagesMatch = pathname.match(/^\/api\/threads\/([^/]+)\/messages$/);
   if (threadMessagesMatch) {
