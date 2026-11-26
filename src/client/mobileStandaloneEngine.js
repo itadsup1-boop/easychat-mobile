@@ -1,4 +1,4 @@
-import { getMachineId, getStoredLicenseKey, setStoredLicenseKey } from './utils/machineId.js';
+import { getMachineId, ensureStableMachineId, getStoredLicenseKey, setStoredLicenseKey } from './utils/machineId.js';
 import { searchMobileStore } from './utils/mobileSearch.js';
 import {
   buildMobileCompanyEmployeesPayload,
@@ -40,6 +40,18 @@ import {
   renderBroadcastTemplate,
   resolveThreadPageSource
 } from './utils/mobileAutomation.js';
+import {
+  cleanLoadedBlobUrls,
+  sanitizeStoreForPersistence,
+  shouldIncrementSentInRun,
+  canRetryRecipient,
+  resolveCampaignEndStatus
+} from './utils/mobileCampaigns.js';
+import {
+  saveMediaBlobToIdb,
+  loadMediaBlobFromIdb,
+  deleteMediaBlobFromIdb
+} from './utils/mobileMediaStore.js';
 
 const LICENSE_SERVER_BASE = 'https://genblackmmoonline.online/license_server';
 const GRAPH_API_BASE = 'https://graph.facebook.com/v21.0';
@@ -190,6 +202,7 @@ function normalizeLoadedStore(data) {
   }
   next.threads = dedupedThreads;
   next.leadTags = Array.isArray(data.leadTags) ? data.leadTags : [];
+  cleanLoadedBlobUrls(next);
 
   for (const tid of Object.keys(next.contactsByThread)) {
     const c = next.contactsByThread[tid];
@@ -422,7 +435,8 @@ export async function syncFromDesktopToMobile(nativeFetch = window._easychatNati
 
 function saveStore() {
   try {
-    window.localStorage?.setItem(STORAGE_KEY, JSON.stringify(store));
+    const clean = sanitizeStoreForPersistence(store);
+    window.localStorage?.setItem(STORAGE_KEY, JSON.stringify(clean));
   } catch (err) {
     console.warn('[MobileEngine] Storage quota warning, trimming old messages:', err?.message);
     try {
@@ -431,7 +445,8 @@ function saveStore() {
           store.messagesByThread[tid] = store.messagesByThread[tid].slice(-60);
         }
       }
-      window.localStorage?.setItem(STORAGE_KEY, JSON.stringify(store));
+      const clean = sanitizeStoreForPersistence(store);
+      window.localStorage?.setItem(STORAGE_KEY, JSON.stringify(clean));
     } catch (_) {}
   }
 }
@@ -868,12 +883,32 @@ async function sendPageMessageOnMobile(nativeFetch, { threadId, content, attachm
   let maxSeq = existingList.reduce((mx, m) => Math.max(mx, Number(m?.sequence_order ?? m?.id) || 0), 0);
 
   // 1. Send attachments first if any
-  let missingAttachmentCount = 0;
   for (const attId of attachmentIds) {
-    const staged = stagedFiles.get(String(attId));
+    const key = String(attId);
+    let staged = stagedFiles.get(key);
     if (!staged || !staged.file) {
-      missingAttachmentCount += 1;
-      continue;
+      const fromIdb = await loadMediaBlobFromIdb(key);
+      if (fromIdb?.file) {
+        const previewUrl = URL.createObjectURL(fromIdb.file);
+        staged = {
+          id: key,
+          attachment_id: key,
+          file: fromIdb.file,
+          preview_url: previewUrl,
+          media_url: previewUrl,
+          media_type: fromIdb.media_type || 'file',
+          name: fromIdb.name || 'attachment',
+          safe_name: fromIdb.safe_name || fromIdb.name || 'attachment',
+          original_name: fromIdb.original_name || fromIdb.name || 'attachment',
+          byte_size: Number(fromIdb.byte_size || fromIdb.file.size || 0),
+          size: Number(fromIdb.byte_size || fromIdb.file.size || 0),
+          mime_type: fromIdb.mime_type || fromIdb.file.type || 'application/octet-stream'
+        };
+        stagedFiles.set(key, staged);
+      }
+    }
+    if (!staged || !staged.file) {
+      throw new Error('Tệp đính kèm không còn khả dụng. Vui lòng chọn lại file.');
     }
     const form = new FormData();
     form.append('recipient', JSON.stringify({ id: psid }));
@@ -927,13 +962,16 @@ async function sendPageMessageOnMobile(nativeFetch, { threadId, content, attachm
     thread.last_message = `Bạn: ${previewLabel}`;
     thread.last_activity = new Date(nowMs).toISOString();
     thread.last_msg_ts = nowMs;
+
+    // Clean up one-shot chat attachments after successful send (keep campaign attachments 'catt_' for other recipients)
+    if (!key.startsWith('catt_')) {
+      stagedFiles.delete(key);
+      deleteMediaBlobFromIdb(key).catch(() => {});
+    }
   }
 
   // 2. Send text content if any
   const text = String(content || '').trim();
-  if (!text && missingAttachmentCount > 0 && createdMessages.length === 0) {
-    throw new Error('File đính kèm không còn tồn tại. Vui lòng chọn lại file.');
-  }
   if (text) {
     const sendUrl = `${GRAPH_API_BASE}/${pageId}/messages?access_token=${encodeURIComponent(source.token)}`;
     const resp = await nativeFetch(sendUrl, {
@@ -1165,7 +1203,7 @@ export async function handleMobileStandaloneApi(nativeFetch, urlStr, input, init
   const parsedUrl = new URL(urlStr, 'https://localhost');
   const pathname = parsedUrl.pathname;
   const method = String(init?.method || (input instanceof Request ? input.method : 'GET')).toUpperCase();
-  const machineId = getMachineId();
+  const machineId = await ensureStableMachineId();
 
   // 1. Health & Update Status
   if (pathname === '/api/health') {
@@ -1340,6 +1378,9 @@ export async function handleMobileStandaloneApi(nativeFetch, urlStr, input, init
         });
         const vData = await vResp.json().catch(() => ({}));
         if (vData?.valid) {
+          if (store.threads.length === 0) {
+            syncFromDesktopToMobile(nativeFetch).catch(() => {});
+          }
           return jsonResponse({
             success: true,
             data: {
@@ -1372,29 +1413,36 @@ export async function handleMobileStandaloneApi(nativeFetch, urlStr, input, init
     const user = getSavedUser();
     const key = String(body.key || '').trim();
     if (!key) return jsonResponse({ success: false, message: 'Thiếu mã Key' }, 400);
-    const resp = await nativeFetch(`${LICENSE_SERVER_BASE}/api/license/activate`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        key,
-        machineId,
-        deviceName: 'EasyChat Mobile Android',
-        clientUsername: user?.username || null
-      })
-    });
-    const result = await resp.json().catch(() => ({}));
-    if (resp.ok && result.success) {
-      setStoredLicenseKey(key);
-      return jsonResponse({
-        success: true,
-        message: result.message || 'Kích hoạt bản quyền thành công!',
-        data: { isLicensed: true, key, ...result.data }
+    try {
+      const resp = await nativeFetch(`${LICENSE_SERVER_BASE}/api/license/activate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          key,
+          machineId,
+          deviceName: 'EasyChat Mobile Android',
+          clientUsername: user?.username || null
+        })
       });
+      const result = await resp.json().catch(() => ({}));
+      if (resp.ok && result.success) {
+        setStoredLicenseKey(key);
+        return jsonResponse({
+          success: true,
+          message: result.message || 'Kích hoạt bản quyền thành công!',
+          data: { isLicensed: true, key, ...result.data }
+        });
+      }
+      return jsonResponse({
+        success: false,
+        message: result.message || result.error || 'Kích hoạt Key thất bại.'
+      }, 400);
+    } catch (err) {
+      return jsonResponse({
+        success: false,
+        message: 'Không thể kết nối máy chủ bản quyền (' + (err?.message || 'Lỗi mạng') + ')'
+      }, 503);
     }
-    return jsonResponse({
-      success: false,
-      message: result.message || result.error || 'Kích hoạt Key thất bại.'
-    }, 400);
   }
   if (pathname === '/api/license/deactivate' && method === 'POST') {
     const savedKey = getStoredLicenseKey();
@@ -1771,6 +1819,7 @@ export async function handleMobileStandaloneApi(nativeFetch, urlStr, input, init
       file,
       createPreviewUrl: (f) => URL.createObjectURL(f)
     });
+    saveMediaBlobToIdb(record.id, record).catch(() => {});
     const { file: _rawFile, ...publicAttachment } = record;
     return jsonResponse({ success: true, attachment: publicAttachment, data: publicAttachment }, 201);
   }
@@ -1789,6 +1838,7 @@ export async function handleMobileStandaloneApi(nativeFetch, urlStr, input, init
         error: 'File không thuộc hội thoại này hoặc không còn ở trạng thái chờ gửi.'
       }, 409);
     }
+    deleteMediaBlobFromIdb(attachmentId).catch(() => {});
     return new Response(null, { status: 204 });
   }
 
@@ -2146,7 +2196,12 @@ export async function handleMobileStandaloneApi(nativeFetch, urlStr, input, init
     for (const m of (camp.messages || [])) {
       m.attachments = (m.attachments || []).filter((a) => String(a.id) !== attId);
     }
+    const existingStaged = stagedFiles.get(attId);
+    if (existingStaged?.preview_url && String(existingStaged.preview_url).startsWith('blob:')) {
+      try { URL.revokeObjectURL(existingStaged.preview_url); } catch (_) {}
+    }
     stagedFiles.delete(attId);
+    deleteMediaBlobFromIdb(attId).catch(() => {});
     camp.updated_at = new Date().toISOString();
     saveStore();
     return jsonResponse({ success: true, campaign: recomputeMobileCampaignCounts(camp) });
@@ -2171,7 +2226,7 @@ export async function handleMobileStandaloneApi(nativeFetch, urlStr, input, init
       const mime = String(file.type || '');
       const mediaType = mime.startsWith('video/') ? 'video' : (mime.startsWith('image/') ? 'image' : 'file');
       const previewUrl = URL.createObjectURL(file);
-      stagedFiles.set(id, {
+      const stagedRecord = {
         id,
         attachment_id: id,
         file,
@@ -2179,9 +2234,14 @@ export async function handleMobileStandaloneApi(nativeFetch, urlStr, input, init
         media_url: previewUrl,
         media_type: mediaType,
         name: file.name || 'attachment',
+        safe_name: file.name || 'attachment',
+        original_name: file.name || 'attachment',
+        byte_size: file.size || 0,
         size: file.size || 0,
         mime_type: mime
-      });
+      };
+      stagedFiles.set(id, stagedRecord);
+      await saveMediaBlobToIdb(id, stagedRecord);
       targetMsg.attachments.push({
         id,
         original_name: file.name || 'attachment',
@@ -2547,31 +2607,40 @@ function recomputeMobileCampaignCounts(camp) {
 }
 
 async function sendMobileCampaignToRecipient(nativeFetch, camp, rec) {
-  rec.status = 'processing';
-  rec.attempts = Number(rec.attempts || 0) + 1;
-  rec.error_message = null;
-  recomputeMobileCampaignCounts(camp);
-  broadcastMobileSocket('CAMPAIGN_UPDATED', { campaign_id: camp.id });
-
-  try {
-    const msgs = Array.isArray(camp.messages) ? camp.messages : [];
-    for (const m of msgs) {
-      const text = String(m?.text_content || m?.content || '').trim();
-      const attIds = Array.isArray(m?.attachments) ? m.attachments.map((a) => a.id).filter(Boolean) : [];
-      if (!text && !attIds.length) continue;
-      await sendPageMessageOnMobile(nativeFetch, {
-        threadId: rec.thread_id,
-        content: text,
-        attachmentIds: attIds,
-        clientMessageId: `camp_${camp.id}_${rec.id}_${m.id || Date.now()}`
-      });
-    }
-    rec.status = 'sent';
-    rec.sent_at = new Date().toISOString();
+  const maxRetries = Math.max(0, Number(camp?.max_retries ?? 0));
+  while (camp.status === 'running') {
+    rec.status = 'processing';
+    rec.attempts = Number(rec.attempts || 0) + 1;
     rec.error_message = null;
-  } catch (err) {
-    rec.status = 'failed';
-    rec.error_message = err?.message || 'Gửi tin thất bại';
+    recomputeMobileCampaignCounts(camp);
+    broadcastMobileSocket('CAMPAIGN_UPDATED', { campaign_id: camp.id });
+
+    try {
+      const msgs = Array.isArray(camp.messages) ? camp.messages : [];
+      for (const m of msgs) {
+        const text = String(m?.text_content || m?.content || '').trim();
+        const attIds = Array.isArray(m?.attachments) ? m.attachments.map((a) => a.id).filter(Boolean) : [];
+        if (!text && !attIds.length) continue;
+        await sendPageMessageOnMobile(nativeFetch, {
+          threadId: rec.thread_id,
+          content: text,
+          attachmentIds: attIds,
+          clientMessageId: `camp_${camp.id}_${rec.id}_${m.id || Date.now()}`
+        });
+      }
+      rec.status = 'sent';
+      rec.sent_at = new Date().toISOString();
+      rec.error_message = null;
+      return;
+    } catch (err) {
+      rec.error_message = err?.message || 'Gửi tin thất bại';
+      if (camp.status === 'running' && canRetryRecipient(rec, maxRetries)) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        continue;
+      }
+      rec.status = 'failed';
+      return;
+    }
   }
 }
 
@@ -2586,34 +2655,43 @@ async function runMobileCampaignLoop(nativeFetch, camp) {
       : allRecs.slice(startIdx);
     const sendCap = Math.max(1, Number(camp.send_cap || ordered.length || 1));
     let sentInRun = 0;
+    let hitSendCap = false;
 
     for (const rec of ordered) {
       if (camp.status !== 'running') break;
       if (rec.status !== 'pending') continue;
-      if (sentInRun >= sendCap) break;
+      if (sentInRun >= sendCap) {
+        hitSendCap = true;
+        break;
+      }
 
       await sendMobileCampaignToRecipient(nativeFetch, camp, rec);
-      sentInRun += 1;
+      if (shouldIncrementSentInRun(rec)) {
+        sentInRun += 1;
+      }
       recomputeMobileCampaignCounts(camp);
       saveStore();
       broadcastMobileSocket('CAMPAIGN_UPDATED', { campaign_id: camp.id });
 
       if (camp.status !== 'running') break;
+      if (sentInRun >= sendCap) {
+        hitSendCap = true;
+        break;
+      }
       const pacingMs = Math.max(500, Number(camp.pacing_ms || 2000));
       await new Promise((resolve) => setTimeout(resolve, pacingMs));
     }
 
     if (camp.status === 'running') {
       recomputeMobileCampaignCounts(camp);
-      camp.status = camp.counts.failed > 0 && camp.counts.sent > 0
-        ? 'completed_with_errors'
-        : (camp.counts.failed > 0 && camp.counts.sent === 0 ? 'failed' : 'completed');
+      const endResult = resolveCampaignEndStatus(camp.counts, { hitSendCap, sendCap });
+      camp.status = endResult.status;
       camp.updated_at = new Date().toISOString();
       if (!Array.isArray(camp.audit)) camp.audit = [];
       camp.audit.push({
         id: `aud_${Date.now()}`,
         action: camp.status,
-        message: `Hoàn tất: đã gửi ${camp.counts.sent}, lỗi ${camp.counts.failed}`,
+        message: endResult.auditMessage,
         created_at: camp.updated_at
       });
       saveStore();

@@ -9,6 +9,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build-apk:
     if: "!contains(github.event.head_commit.message, '[skip ci]')"
@@ -33,7 +37,7 @@ jobs:
       - name: Install dependencies & Capacitor Android
         run: |
           npm install --legacy-peer-deps
-          npm install --no-save @capacitor/core@^6.1.0 @capacitor/cli@^6.1.0 @capacitor/android@^6.1.0
+          npm install --no-save @capacitor/core@^6.1.0 @capacitor/cli@^6.1.0 @capacitor/android@^6.1.0 @capacitor/device@^6.0.0
 
       - name: Build Client UI (dist/client)
         run: |
@@ -45,18 +49,70 @@ jobs:
             npx cap add android
           fi
           npx cap sync android
-          sed -i 's/<application/<application android:usesCleartextTraffic="true"/g' android/app/src/main/AndroidManifest.xml
+          if ! grep -q 'android:usesCleartextTraffic="true"' android/app/src/main/AndroidManifest.xml; then
+            sed -i 's/<application/<application android:usesCleartextTraffic="true"/g' android/app/src/main/AndroidManifest.xml
+          fi
+
+      - name: Configure Release Signing (if GitHub Secrets are set)
+        id: signing
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -n "$ANDROID_KEYSTORE_BASE64" ] && [ -n "$ANDROID_KEYSTORE_PASSWORD" ] && [ -n "$ANDROID_KEY_ALIAS" ] && [ -n "$ANDROID_KEY_PASSWORD" ]; then
+            echo "$ANDROID_KEYSTORE_BASE64" | base64 --decode > android/app/release.keystore
+            node -e '
+              const fs = require("fs");
+              const p = "android/app/build.gradle";
+              let content = fs.readFileSync(p, "utf8");
+              if (!content.includes("signingConfigs {")) {
+                const signingBlock = `
+    signingConfigs {
+        release {
+            storeFile file("release.keystore")
+            storePassword System.getenv("ANDROID_KEYSTORE_PASSWORD")
+            keyAlias System.getenv("ANDROID_KEY_ALIAS")
+            keyPassword System.getenv("ANDROID_KEY_PASSWORD")
+        }
+    }
+    buildTypes {`;
+                content = content.replace("buildTypes {", signingBlock);
+                content = content.replace(/release\s*\{/, "release {\n            signingConfig signingConfigs.release");
+                fs.writeFileSync(p, content, "utf8");
+              }
+            '
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+            echo "Release signing configured with persistent keystore."
+          else
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::ANDROID_KEYSTORE_* secrets not configured; falling back to debug APK (requires uninstall before reinstalling)."
+          fi
 
       - name: Build Android APK (EasyChat-Mobile.apk)
         working-directory: android
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           chmod +x gradlew
-          ./gradlew assembleDebug
+          if [ "${{ steps.signing.outputs.signed }}" = "true" ]; then
+            ./gradlew assembleRelease
+          else
+            ./gradlew assembleDebug
+          fi
 
       - name: Stage APK in apk/EasyChat-Mobile.apk
         run: |
           mkdir -p apk
-          cp android/app/build/outputs/apk/debug/app-debug.apk apk/EasyChat-Mobile.apk
+          if [ "${{ steps.signing.outputs.signed }}" = "true" ]; then
+            cp android/app/build/outputs/apk/release/app-release.apk apk/EasyChat-Mobile.apk
+          else
+            cp android/app/build/outputs/apk/debug/app-debug.apk apk/EasyChat-Mobile.apk
+          fi
+          rm -f android/app/release.keystore
           ls -lh apk/EasyChat-Mobile.apk
 
       - name: Upload APK Artifact
@@ -71,4 +127,4 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -f apk/EasyChat-Mobile.apk
           git commit -m "chore(apk): build EasyChat-Mobile.apk [skip ci]" || true
-          git push origin HEAD:main
+          git push origin HEAD:${{ github.ref_name }}
