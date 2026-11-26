@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Check, CheckSquare, ChevronRight, Eye, Plus, RefreshCw, Square, Trash2, UserPlus, Users, X } from 'lucide-react';
+import { ArrowLeft, Check, CheckSquare, ChevronRight, Eye, Plus, RefreshCw, Square, Trash2, UserPlus, Users, X } from 'lucide-react';
 import ConfirmModal from './ConfirmModal';
 import { normalizeCompanyEmployeesPayload } from '../utils/mobileEmployees.js';
 
@@ -7,7 +7,7 @@ import { normalizeCompanyEmployeesPayload } from '../utils/mobileEmployees.js';
 let _cachedData = null;
 let _cacheLoaded = false;
 
-export default function EmployeeManagementModal() {
+export default function EmployeeManagementModal({ onBack }) {
   const [data, setData] = useState(_cachedData || { employees: [], accounts: [], assignments: {} });
   const [form, setForm] = useState({ username: '', password: '' });
   const [busy, setBusy] = useState(false);
@@ -184,14 +184,25 @@ export default function EmployeeManagementModal() {
 
   return (
     <main className="employee-management-page col-start-2 col-end-[-1] row-start-1 h-full min-h-0 overflow-y-auto bg-slate-50 text-slate-900">
-      <header className="sticky top-0 z-10 border-b border-slate-200 bg-white/95 px-6 py-5 backdrop-blur">
+      <header className="sticky top-0 z-10 border-b border-slate-200 bg-white/95 px-4 py-4 backdrop-blur sm:px-6 sm:py-5">
         <div className="mx-auto flex max-w-6xl items-center gap-3">
-          <span className="grid h-11 w-11 place-items-center rounded-xl bg-blue-50 text-blue-600">
+          {typeof onBack === 'function' && (
+            <button
+              type="button"
+              onClick={onBack}
+              aria-label="Quay lại trang chủ"
+              title="Quay lại trang chủ"
+              className="grid h-10 w-10 shrink-0 place-items-center rounded-xl border border-slate-200 bg-white text-slate-700 hover:border-blue-300 hover:bg-blue-50 hover:text-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-200 transition-colors"
+            >
+              <ArrowLeft size={20} />
+            </button>
+          )}
+          <span className="grid h-11 w-11 shrink-0 place-items-center rounded-xl bg-blue-50 text-blue-600">
             <Users size={22} />
           </span>
-          <div>
-            <h1 className="text-xl font-bold">Quản lý nhân viên</h1>
-            <p className="mt-0.5 text-sm text-slate-500">Tạo tài khoản và cấp tài khoản Facebook cho từng nhân viên.</p>
+          <div className="min-w-0">
+            <h1 className="text-lg font-bold sm:text-xl">Quản lý nhân viên</h1>
+            <p className="mt-0.5 text-xs text-slate-500 sm:text-sm">Tạo tài khoản và cấp tài khoản Facebook cho từng nhân viên.</p>
           </div>
         </div>
       </header>
@@ -233,6 +244,10 @@ export default function EmployeeManagementModal() {
 
           {loading ? (
             <div className="grid min-h-52 place-items-center"><RefreshCw className="animate-spin text-blue-600" /></div>
+          ) : !employeesList.length ? (
+            <div className="px-5 py-14 text-center text-sm text-slate-500">
+              Chưa có nhân viên. Bấm &quot;Thêm nhân viên&quot; để tạo tài khoản đầu tiên.
+            </div>
           ) : (
             <div className="overflow-x-auto">
               <table className="w-full min-w-[760px] border-collapse text-left">
@@ -327,9 +342,6 @@ export default function EmployeeManagementModal() {
                       </tr>
                     );
                   })}
-                  {!employeesList.length && (
-                    <tr><td colSpan="6" className="px-5 py-16 text-center text-sm text-slate-500">Chưa có nhân viên. Bấm "Thêm nhân viên" để tạo tài khoản đầu tiên.</td></tr>
-                  )}
                 </tbody>
               </table>
             </div>

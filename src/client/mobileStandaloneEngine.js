@@ -19,6 +19,27 @@ import {
   setMobileThreadArchived,
   filterMobileThreadsByTab
 } from './utils/mobileFollowup.js';
+import {
+  listMobileAutoReplyRules,
+  createMobileAutoReplyRule,
+  toggleMobileAutoReplyRule,
+  deleteMobileAutoReplyRule,
+  addMobileAutoReplyKeywords,
+  toggleMobileAutoReplyKeyword,
+  deleteMobileAutoReplyKeyword,
+  getMobileAiConfig,
+  saveMobileAiConfig,
+  getMobilePhoneAutomation,
+  saveMobilePhoneAutomation,
+  deleteMobileLeadStatus,
+  deleteMobileQuickTemplate,
+  extractSafeVietnamPhone,
+  applyMobilePhoneAutomation,
+  getMobileBroadcastQuota,
+  consumeMobileBroadcastQuota,
+  renderBroadcastTemplate,
+  resolveThreadPageSource
+} from './utils/mobileAutomation.js';
 
 const LICENSE_SERVER_BASE = 'https://genblackmmoonline.online/license_server';
 const GRAPH_API_BASE = 'https://graph.facebook.com/v21.0';
@@ -75,8 +96,14 @@ function normalizeLoadedStore(data) {
     employeeAssignments: data.employeeAssignments && typeof data.employeeAssignments === 'object' && !Array.isArray(data.employeeAssignments)
       ? { ...data.employeeAssignments }
       : {},
-    aiConfig: data.aiConfig || { enabled: false, provider: 'openai', model: 'gpt-4o-mini', system_prompt: '' },
-    phoneAutomation: data.phoneAutomation || { enabled: true, policy: 'continue', thank_you_text: '', target_status_id: null },
+    aiConfig: data.aiConfig || { enabled: false, provider: 'LOCAL_OLLAMA', model_name: 'llama3', system_prompt: '' },
+    aiConfigByAccount: data.aiConfigByAccount && typeof data.aiConfigByAccount === 'object' && !Array.isArray(data.aiConfigByAccount)
+      ? { ...data.aiConfigByAccount }
+      : {},
+    phoneAutomation: data.phoneAutomation || { enabled: false, status_id: null, target_status_id: null, policy: 'continue', thank_you_text: '' },
+    broadcastQuotaByAccount: data.broadcastQuotaByAccount && typeof data.broadcastQuotaByAccount === 'object' && !Array.isArray(data.broadcastQuotaByAccount)
+      ? { ...data.broadcastQuotaByAccount }
+      : {},
     pageBridgeConfig: data.pageBridgeConfig || { bridge_url: 'https://genblackmmoonline.online/webhook.php', verify_token: 'crmwb_mobile_verify' }
   };
 
@@ -487,9 +514,7 @@ export function broadcastMobileSocket(event, payload) {
 }
 
 function extractPhoneFromText(text) {
-  const m = String(text || '').replace(/[\s.\-()]/g, '').match(/(?:\+84|84|0)(3|5|7|8|9)\d{8}\b/);
-  if (!m) return null;
-  return '0' + m[0].replace(/^(?:\+84|84|0)/, '');
+  return extractSafeVietnamPhone(text);
 }
 
 // ── Facebook Graph API Helpers for Messenger Page ──
@@ -686,15 +711,23 @@ export async function syncPageConversationsOnMobile(nativeFetch, source, options
         if (!enrichedPm.is_outgoing && enrichedPm.content) {
           const detectedPhone = extractPhoneFromText(enrichedPm.content);
           if (detectedPhone) {
-            const existingContact = store.contactsByThread[threadId] || {};
-            if (!existingContact.phone) {
-              store.contactsByThread[threadId] = {
-                ...existingContact,
+            const autoResult = applyMobilePhoneAutomation(store, threadId, detectedPhone, customerName);
+            if (options.broadcastRealtime && (autoResult.phoneCaptured || autoResult.statusApplied)) {
+              broadcastMobileSocket('CONTACT_UPDATED', {
                 thread_id: threadId,
-                name: customerName,
+                phone: autoResult.contact?.phone || detectedPhone,
+                ...(autoResult.statusApplied && autoResult.status ? {
+                  status_id: autoResult.status.id,
+                  lead_status_id: autoResult.status.id,
+                  status_name: autoResult.status.name,
+                  status_color: autoResult.status.color
+                } : {})
+              });
+              broadcastMobileSocket('PHONE_CAPTURED', {
+                thread_id: threadId,
                 phone: detectedPhone,
-                phone_captured_at: new Date().toISOString()
-              };
+                status_id: autoResult.status?.id ?? null
+              });
             }
           }
         }
@@ -740,14 +773,18 @@ export async function syncPageConversationsOnMobile(nativeFetch, source, options
             ? (newlyArrived.some((m) => !m.is_outgoing) ? 1 : Number(existingThread.is_unread || 0))
             : (Number(conv.unread_count) > 0 ? 1 : 0)),
       status: existingThread?.status || 'UNPROCESSED',
-      lead_status_id: contactRecord.lead_status_id ?? existingThread?.lead_status_id ?? null,
+      status_id: contactRecord.status_id ?? contactRecord.lead_status_id ?? existingThread?.status_id ?? existingThread?.lead_status_id ?? null,
+      lead_status_id: contactRecord.lead_status_id ?? contactRecord.status_id ?? existingThread?.lead_status_id ?? existingThread?.status_id ?? null,
+      status_name: contactRecord.status_name ?? existingThread?.status_name ?? null,
+      status_color: contactRecord.status_color ?? existingThread?.status_color ?? null,
       is_vip: contactRecord.is_vip ?? existingThread?.is_vip ?? 0,
       pinned: pinnedVal,
       is_pinned: pinnedVal,
       inbox_folder: existingThread?.inbox_folder || 'INBOX',
       archived_at: existingThread?.archived_at || null,
       reminder_due_at: existingThread?.reminder_due_at || null,
-      reminder_note: existingThread?.reminder_note || null
+      reminder_note: existingThread?.reminder_note || null,
+      reminder_status: existingThread?.reminder_status || null
     };
 
     if (existingThreadIdx >= 0) {
@@ -818,12 +855,11 @@ export async function syncPageConversationsOnMobile(nativeFetch, source, options
 async function sendPageMessageOnMobile(nativeFetch, { threadId, content, attachmentIds = [], clientMessageId }) {
   const thread = store.threads.find((t) => String(t.id) === String(threadId));
   if (!thread) throw new Error('Không tìm thấy hội thoại Fanpage');
-  const source = store.inboxSources.find((s) => String(s.id) === String(thread.source_id))
-    || store.inboxSources.find((s) => s.source_type === 'page_messenger' && String(s.external_id) === String(thread.source_external_id || '') && s.token)
-    || store.inboxSources.find((s) => s.source_type === 'page_messenger' && s.status === 'ACTIVE' && s.token);
-  if (!source || !source.token) {
-    throw new Error('Fanpage chưa có Page Access Token. Vui lòng đồng bộ lại từ App Desktop hoặc nhập Token.');
+  const resolvedSource = resolveThreadPageSource(thread, store.inboxSources);
+  if (!resolvedSource.ok || !resolvedSource.source) {
+    throw new Error(resolvedSource.error || 'Fanpage chưa có Page Access Token. Vui lòng đồng bộ lại từ App Desktop hoặc nhập Token.');
   }
+  const source = resolvedSource.source;
 
   const pageId = String(source.external_id);
   const psid = String(thread.external_thread_id || String(threadId).split(':').pop());
@@ -1857,15 +1893,15 @@ export async function handleMobileStandaloneApi(nativeFetch, urlStr, input, init
       };
       store.leadStatuses.push(created);
       saveStore();
-      return jsonResponse({ success: true, status: created, data: created });
+      return jsonResponse({ success: true, ...created, status: created, data: created }, 201);
     }
   }
   const leadStatusDelMatch = pathname.match(/^\/api\/lead-statuses\/([^/]+)$/);
   if (leadStatusDelMatch && method === 'DELETE') {
-    const id = Number(leadStatusDelMatch[1]);
-    store.leadStatuses = store.leadStatuses.filter((s) => Number(s.id) !== id);
+    const id = decodeURIComponent(leadStatusDelMatch[1]);
+    const res = deleteMobileLeadStatus(store, id);
     saveStore();
-    return jsonResponse({ success: true });
+    return jsonResponse(res);
   }
 
   // 9. Quick Templates & Auto-Reply
@@ -1876,22 +1912,90 @@ export async function handleMobileStandaloneApi(nativeFetch, urlStr, input, init
       const item = { id: Date.now(), shortcut: body.shortcut || '', content: body.content || '', title: body.title || '' };
       store.quickTemplates.push(item);
       saveStore();
-      return jsonResponse({ success: true, template: item, data: item });
+      return jsonResponse({ success: true, ...item, template: item, data: item }, 201);
     }
   }
-  if (pathname === '/api/auto-reply' || pathname === '/api/auto-reply/rules') {
-    if (method === 'GET') return jsonResponse(store.autoReplyRules);
+  const quickTemplateDelMatch = pathname.match(/^\/api\/quick-templates\/([^/]+)$/);
+  if (quickTemplateDelMatch && method === 'DELETE') {
+    const id = decodeURIComponent(quickTemplateDelMatch[1]);
+    const res = deleteMobileQuickTemplate(store, id);
+    if (res.ok) saveStore();
+    return jsonResponse(res.data, res.status);
+  }
+  const accAutoRepliesMatch = pathname.match(/^\/api\/accounts\/([^/]+)\/auto-replies$/);
+  if (accAutoRepliesMatch) {
+    const accId = decodeURIComponent(accAutoRepliesMatch[1]);
+    if (method === 'GET') {
+      return jsonResponse(listMobileAutoReplyRules(store, accId));
+    }
     if (method === 'POST') {
       const body = await parseRequestBody(input, init);
-      const rule = { id: Date.now(), ...body, is_active: 1 };
-      store.autoReplyRules.push(rule);
-      saveStore();
-      return jsonResponse({ success: true, rule });
+      const res = createMobileAutoReplyRule(store, accId, body);
+      if (res.ok) saveStore();
+      return jsonResponse(res.data, res.status);
+    }
+  }
+  const autoReplyKwToggleMatch = pathname.match(/^\/api\/auto-replies\/keywords\/([^/]+)\/toggle$/);
+  if (autoReplyKwToggleMatch && method === 'PATCH') {
+    const kwId = decodeURIComponent(autoReplyKwToggleMatch[1]);
+    const body = await parseRequestBody(input, init);
+    const res = toggleMobileAutoReplyKeyword(store, kwId, body?.is_active);
+    if (res.ok) saveStore();
+    return jsonResponse(res.data, res.status);
+  }
+  const autoReplyKwDelMatch = pathname.match(/^\/api\/auto-replies\/keywords\/([^/]+)$/);
+  if (autoReplyKwDelMatch && method === 'DELETE') {
+    const kwId = decodeURIComponent(autoReplyKwDelMatch[1]);
+    const res = deleteMobileAutoReplyKeyword(store, kwId);
+    if (res.ok) saveStore();
+    return jsonResponse(res.data, res.status);
+  }
+  const autoReplyAddKwMatch = pathname.match(/^\/api\/auto-replies\/([^/]+)\/keywords$/);
+  if (autoReplyAddKwMatch && method === 'POST') {
+    const ruleId = decodeURIComponent(autoReplyAddKwMatch[1]);
+    const body = await parseRequestBody(input, init);
+    const res = addMobileAutoReplyKeywords(store, ruleId, body?.keyword);
+    if (res.ok) saveStore();
+    return jsonResponse(res.data, res.status);
+  }
+  const autoReplyToggleMatch = pathname.match(/^\/api\/auto-replies\/([^/]+)\/toggle$/);
+  if (autoReplyToggleMatch && method === 'PATCH') {
+    const ruleId = decodeURIComponent(autoReplyToggleMatch[1]);
+    const body = await parseRequestBody(input, init);
+    const res = toggleMobileAutoReplyRule(store, ruleId, body?.is_active);
+    if (res.ok) saveStore();
+    return jsonResponse(res.data, res.status);
+  }
+  const autoReplyDelMatch = pathname.match(/^\/api\/auto-replies\/([^/]+)$/);
+  if (autoReplyDelMatch && method === 'DELETE') {
+    const ruleId = decodeURIComponent(autoReplyDelMatch[1]);
+    const res = deleteMobileAutoReplyRule(store, ruleId);
+    if (res.ok) saveStore();
+    return jsonResponse(res.data, res.status);
+  }
+  if (pathname === '/api/auto-reply' || pathname === '/api/auto-reply/rules') {
+    if (method === 'GET') return jsonResponse(listMobileAutoReplyRules(store, ''));
+    if (method === 'POST') {
+      const body = await parseRequestBody(input, init);
+      const res = createMobileAutoReplyRule(store, body?.account_id || '', body);
+      if (res.ok) saveStore();
+      return jsonResponse(res.data, res.status);
     }
   }
 
   // 10. Comment Leads (Fanpage Post Comments via Graph API)
   if (pathname.startsWith('/api/comment-leads')) {
+    if (pathname === '/api/comment-leads/config' && method === 'GET') {
+      return jsonResponse({
+        success: true,
+        configured: false,
+        mode: 'mobile_standalone',
+        message: 'Quét bình luận tự động cần kết nối App Desktop.'
+      });
+    }
+    if (pathname === '/api/comment-leads' && method === 'GET') {
+      return jsonResponse({ success: true, posts: [], leads: [] });
+    }
     if (pathname === '/api/comment-leads/posts' && method === 'GET') {
       const posts = [];
       for (const src of store.inboxSources.filter((s) => s.source_type === 'page_messenger' && s.status === 'ACTIVE' && s.token)) {
@@ -1908,7 +2012,57 @@ export async function handleMobileStandaloneApi(nativeFetch, urlStr, input, init
       }
       return jsonResponse({ success: true, posts, items: posts });
     }
-    return jsonResponse({ success: true, items: [], posts: [] });
+    return jsonResponse({
+      success: false,
+      state: 'error',
+      error: 'Tính năng quét bình luận & tự gửi tin yêu cầu kết nối App Desktop.'
+    }, 400);
+  }
+
+  // 10b. Broadcast (BroadcastModal.jsx)
+  const broadcastQuotaMatch = pathname.match(/^\/api\/accounts\/([^/]+)\/broadcast\/quota$/);
+  if (broadcastQuotaMatch && method === 'GET') {
+    const accId = decodeURIComponent(broadcastQuotaMatch[1]);
+    return jsonResponse(getMobileBroadcastQuota(store, accId));
+  }
+  const broadcastStartMatch = pathname.match(/^\/api\/accounts\/([^/]+)\/broadcast$/);
+  if (broadcastStartMatch && method === 'POST') {
+    const accId = decodeURIComponent(broadcastStartMatch[1]);
+    const body = await parseRequestBody(input, init);
+    const threadIds = Array.isArray(body?.thread_ids) ? body.thread_ids.map(String).filter(Boolean) : [];
+    const messageTemplate = String(body?.message || '').trim();
+    if (!messageTemplate) {
+      return jsonResponse({ success: false, error: 'Nội dung tin nhắn không được để trống.' }, 400);
+    }
+    if (threadIds.length === 0) {
+      return jsonResponse({ success: false, error: 'Không có khách hàng nào để gửi Broadcast.' }, 400);
+    }
+    const quota = getMobileBroadcastQuota(store, accId);
+    if (quota.remaining <= 0) {
+      return jsonResponse({ success: false, error: 'Đã hết giới hạn gửi Broadcast hôm nay.' }, 429);
+    }
+    const allowedIds = threadIds.slice(0, quota.remaining);
+    const campaignId = `bc_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const job = { id: campaignId, accountId: accId, cancelled: false, total: allowedIds.length, sent: 0, failed: 0 };
+    activeBroadcastJobs.set(campaignId, job);
+    runMobileBroadcastLoop(nativeFetch, job, allowedIds, messageTemplate).catch(() => {});
+    return jsonResponse({ success: true, campaignId, total: allowedIds.length });
+  }
+  const broadcastCancelMatch = pathname.match(/^\/api\/broadcast\/([^/]+)\/cancel$/);
+  if (broadcastCancelMatch && method === 'POST') {
+    const bcId = decodeURIComponent(broadcastCancelMatch[1]);
+    const job = activeBroadcastJobs.get(bcId);
+    if (job) {
+      job.cancelled = true;
+      broadcastMobileSocket('BROADCAST_PROGRESS', {
+        campaignId: bcId,
+        sent: job.sent,
+        failed: job.failed,
+        total: job.total,
+        status: 'PARTIAL'
+      });
+    }
+    return jsonResponse({ success: true });
   }
 
   // 11. Campaigns, AI Config, Phone Automation, Employees, Search
@@ -2175,21 +2329,30 @@ export async function handleMobileStandaloneApi(nativeFetch, urlStr, input, init
       return jsonResponse(camp);
     }
   }
-  if (pathname === '/api/ai-config') {
-    if (method === 'POST' || method === 'PUT') {
-      const body = await parseRequestBody(input, init);
-      store.aiConfig = { ...store.aiConfig, ...body };
-      saveStore();
-    }
-    return jsonResponse({ success: true, config: store.aiConfig, ...store.aiConfig });
+  if (pathname === '/api/ollama/health' && method === 'GET') {
+    return jsonResponse({ online: false });
   }
-  if (pathname.startsWith('/api/phone-automation')) {
+  const accAiConfigMatch = pathname.match(/^\/api\/accounts\/([^/]+)\/ai-config$/);
+  if (accAiConfigMatch || pathname === '/api/ai-config') {
+    const accId = accAiConfigMatch ? decodeURIComponent(accAiConfigMatch[1]) : '';
     if (method === 'POST' || method === 'PUT') {
       const body = await parseRequestBody(input, init);
-      store.phoneAutomation = { ...store.phoneAutomation, ...body };
+      const saved = saveMobileAiConfig(store, accId, body);
       saveStore();
+      return jsonResponse({ ...saved, config: saved });
     }
-    return jsonResponse({ success: true, settings: store.phoneAutomation, ...store.phoneAutomation });
+    const current = getMobileAiConfig(store, accId);
+    return jsonResponse({ ...current, config: current });
+  }
+  if (pathname === '/api/settings/phone-automation' || pathname.startsWith('/api/phone-automation')) {
+    if (method === 'POST' || method === 'PUT') {
+      const body = await parseRequestBody(input, init);
+      const res = saveMobilePhoneAutomation(store, body);
+      if (res.ok) saveStore();
+      return jsonResponse(res.ok ? { ...res.data, settings: res.data } : res.data, res.status);
+    }
+    const current = getMobilePhoneAutomation(store);
+    return jsonResponse({ ...current, settings: current });
   }
   if (pathname === '/api/company/employees' || pathname === '/api/employees') {
     const user = getSavedUser();
@@ -2276,7 +2439,63 @@ export async function handleMobileStandaloneApi(nativeFetch, urlStr, input, init
     return jsonResponse(results);
   }
 
-  return jsonResponse({ success: true });
+  console.warn('[MobileStandalone] Unhandled API route:', method, pathname);
+  return jsonResponse({
+    success: false,
+    code: 'MOBILE_ROUTE_NOT_SUPPORTED',
+    error: 'Tính năng này chưa được hỗ trợ ở chế độ Mobile độc lập.'
+  }, 404);
+}
+
+const activeBroadcastJobs = new Map();
+
+async function runMobileBroadcastLoop(nativeFetch, job, threadIds, messageTemplate) {
+  try {
+    broadcastMobileSocket('BROADCAST_PROGRESS', {
+      campaignId: job.id,
+      sent: 0,
+      failed: 0,
+      total: job.total,
+      status: 'RUNNING'
+    });
+    for (const tid of threadIds) {
+      if (job.cancelled) break;
+      const thread = store.threads.find((t) => String(t.id) === String(tid));
+      const contact = store.contactsByThread[String(tid)];
+      const displayName = contact?.nickname || thread?.nickname || thread?.contact_name || 'bạn';
+      const personalized = renderBroadcastTemplate(messageTemplate, displayName);
+      try {
+        await sendPageMessageOnMobile(nativeFetch, {
+          threadId: tid,
+          content: personalized,
+          clientMessageId: `${job.id}_${tid}_${Date.now()}`
+        });
+        job.sent += 1;
+        consumeMobileBroadcastQuota(store, job.accountId, 1);
+        saveStore();
+      } catch (_) {
+        job.failed += 1;
+      }
+      broadcastMobileSocket('BROADCAST_PROGRESS', {
+        campaignId: job.id,
+        sent: job.sent,
+        failed: job.failed,
+        total: job.total,
+        status: job.cancelled ? 'PARTIAL' : 'RUNNING'
+      });
+      if (job.cancelled) break;
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+    }
+    broadcastMobileSocket('BROADCAST_PROGRESS', {
+      campaignId: job.id,
+      sent: job.sent,
+      failed: job.failed,
+      total: job.total,
+      status: job.cancelled || job.failed > 0 ? 'PARTIAL' : 'COMPLETED'
+    });
+  } finally {
+    activeBroadcastJobs.delete(job.id);
+  }
 }
 
 function upsertMobilePageSource({ pageId, name, avatarUrl, token }) {

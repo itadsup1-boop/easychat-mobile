@@ -196,7 +196,7 @@ html, body, #root {
 }
 
 /* Dedicated application page: keep navigation & modals, hide background chat columns. */
-.employee-view > :not(.app-sidebar-shell):not(.employee-management-page):not(.fixed):not([role="dialog"]) {
+.employee-view > :not(.app-sidebar-shell):not(.employee-management-page):not(.mobile-bottom-nav):not(.fixed):not([role="dialog"]) {
   display: none;
 }
 
@@ -317,6 +317,7 @@ html, body, #root {
     width: 100% !important;
     height: 100% !important;
     overflow-y: auto !important;
+    padding-bottom: calc(72px + env(safe-area-inset-bottom, 0px)) !important;
   }
 
   .lead-drawer {

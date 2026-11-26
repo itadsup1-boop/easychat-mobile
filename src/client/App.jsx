@@ -2452,7 +2452,7 @@ export default function App() {
         updateStatus={appUpdateStatus}
       />
 
-      {activeView === 'employees' && <EmployeeManagementModal />}
+      {activeView === 'employees' && <EmployeeManagementModal onBack={() => setActiveView('chat')} />}
 
       {/* Column 2: Conversation List */}
       <ConversationSidebar
