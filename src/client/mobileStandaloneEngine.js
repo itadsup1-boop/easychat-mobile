@@ -1,4 +1,24 @@
 import { getMachineId, getStoredLicenseKey, setStoredLicenseKey } from './utils/machineId.js';
+import { searchMobileStore } from './utils/mobileSearch.js';
+import {
+  buildMobileCompanyEmployeesPayload,
+  addMobileEmployee,
+  findMobileEmployeeById,
+  setMobileEmployeeAssignments,
+  removeMobileEmployee
+} from './utils/mobileEmployees.js';
+import {
+  toGraphAttachmentType,
+  stageMobileAttachment,
+  discardMobileAttachment,
+  buildOutboundClientMessageId
+} from './utils/mobileAttachments.js';
+import {
+  setMobileThreadReminder,
+  closeMobileThreadReminder,
+  setMobileThreadArchived,
+  filterMobileThreadsByTab
+} from './utils/mobileFollowup.js';
 
 const LICENSE_SERVER_BASE = 'https://genblackmmoonline.online/license_server';
 const GRAPH_API_BASE = 'https://graph.facebook.com/v21.0';
@@ -52,6 +72,9 @@ function normalizeLoadedStore(data) {
     autoReplyRules: Array.isArray(data.autoReplyRules) ? data.autoReplyRules : [],
     campaigns: Array.isArray(data.campaigns) ? data.campaigns : [],
     employees: Array.isArray(data.employees) ? data.employees : [],
+    employeeAssignments: data.employeeAssignments && typeof data.employeeAssignments === 'object' && !Array.isArray(data.employeeAssignments)
+      ? { ...data.employeeAssignments }
+      : {},
     aiConfig: data.aiConfig || { enabled: false, provider: 'openai', model: 'gpt-4o-mini', system_prompt: '' },
     phoneAutomation: data.phoneAutomation || { enabled: true, policy: 'continue', thank_you_text: '', target_status_id: null },
     pageBridgeConfig: data.pageBridgeConfig || { bridge_url: 'https://genblackmmoonline.online/webhook.php', verify_token: 'crmwb_mobile_verify' }
@@ -809,19 +832,23 @@ async function sendPageMessageOnMobile(nativeFetch, { threadId, content, attachm
   let maxSeq = existingList.reduce((mx, m) => Math.max(mx, Number(m?.sequence_order ?? m?.id) || 0), 0);
 
   // 1. Send attachments first if any
+  let missingAttachmentCount = 0;
   for (const attId of attachmentIds) {
     const staged = stagedFiles.get(String(attId));
-    if (!staged || !staged.file) continue;
+    if (!staged || !staged.file) {
+      missingAttachmentCount += 1;
+      continue;
+    }
     const form = new FormData();
     form.append('recipient', JSON.stringify({ id: psid }));
     form.append('messaging_type', 'RESPONSE');
     form.append('message', JSON.stringify({
       attachment: {
-        type: staged.media_type === 'video' ? 'video' : (staged.media_type === 'image' ? 'image' : 'file'),
+        type: toGraphAttachmentType(staged.media_type),
         payload: { is_reusable: true }
       }
     }));
-    form.append('filedata', staged.file, staged.name || 'upload');
+    form.append('filedata', staged.file, staged.safe_name || staged.name || 'upload');
 
     const uploadUrl = `${GRAPH_API_BASE}/${pageId}/messages?access_token=${encodeURIComponent(source.token)}`;
     const resp = await nativeFetch(uploadUrl, { method: 'POST', body: form });
@@ -835,7 +862,7 @@ async function sendPageMessageOnMobile(nativeFetch, { threadId, content, attachm
     const attMsg = {
       id: mid,
       fb_message_id: mid,
-      client_message_id: clientMessageId || `client_${nowMs}`,
+      client_message_id: buildOutboundClientMessageId(clientMessageId, false, nowMs),
       attachment_id: attId,
       thread_id: thread.id,
       sender_id: pageId,
@@ -843,6 +870,9 @@ async function sendPageMessageOnMobile(nativeFetch, { threadId, content, attachm
       content: '',
       media_type: staged.media_type || 'image',
       media_url: staged.preview_url,
+      media_name: staged.safe_name || staged.original_name || staged.name || null,
+      media_mime_type: staged.mime_type || null,
+      media_size: staged.byte_size || staged.size || null,
       is_outgoing: 1,
       sender_role: 'operator',
       direction_status: 'confirmed',
@@ -855,13 +885,19 @@ async function sendPageMessageOnMobile(nativeFetch, { threadId, content, attachm
     if (!store.messagesByThread[thread.id]) store.messagesByThread[thread.id] = [];
     store.messagesByThread[thread.id].push(attMsg);
     createdMessages.push(attMsg);
-    thread.last_message = staged.media_type === 'video' ? 'Bạn: [Video]' : 'Bạn: [Ảnh]';
+    const previewLabel = staged.media_type === 'video'
+      ? '[Video]'
+      : (staged.media_type === 'image' ? '[Ảnh]' : (staged.media_type === 'voice' ? '[Ghi âm]' : '[Tệp]'));
+    thread.last_message = `Bạn: ${previewLabel}`;
     thread.last_activity = new Date(nowMs).toISOString();
     thread.last_msg_ts = nowMs;
   }
 
   // 2. Send text content if any
   const text = String(content || '').trim();
+  if (!text && missingAttachmentCount > 0 && createdMessages.length === 0) {
+    throw new Error('File đính kèm không còn tồn tại. Vui lòng chọn lại file.');
+  }
   if (text) {
     const sendUrl = `${GRAPH_API_BASE}/${pageId}/messages?access_token=${encodeURIComponent(source.token)}`;
     const resp = await nativeFetch(sendUrl, {
@@ -883,7 +919,7 @@ async function sendPageMessageOnMobile(nativeFetch, { threadId, content, attachm
     const txtMsg = {
       id: mid,
       fb_message_id: mid,
-      client_message_id: clientMessageId || `client_${nowMs}`,
+      client_message_id: buildOutboundClientMessageId(clientMessageId, createdMessages.length > 0, nowMs),
       thread_id: thread.id,
       sender_id: pageId,
       sender_name: 'Bạn',
@@ -1509,10 +1545,8 @@ export async function handleMobileStandaloneApi(nativeFetch, urlStr, input, init
 
   // 6. Threads & Messages
   if (pathname === '/api/threads' && method === 'GET') {
-    const sorted = store.threads
-      .filter((t) => !t.archived_at)
-      .slice()
-      .sort((a, b) => (Number(b.is_pinned) - Number(a.is_pinned)) || ((Number(b.last_msg_ts) || 0) - (Number(a.last_msg_ts) || 0)));
+    const tab = parsedUrl.searchParams.get('tab') || 'ALL';
+    const sorted = filterMobileThreadsByTab(store.threads, tab);
     return jsonResponse(sorted);
   }
   if (pathname === '/api/threads/waiting-count') {
@@ -1621,29 +1655,58 @@ export async function handleMobileStandaloneApi(nativeFetch, urlStr, input, init
   if (threadMembersMatch) {
     return jsonResponse({ success: true, members: [] });
   }
+  const threadReminderCompleteMatch = pathname.match(/^\/api\/threads\/([^/]+)\/reminder\/complete$/);
+  if (threadReminderCompleteMatch && method === 'POST') {
+    const tid = decodeURIComponent(threadReminderCompleteMatch[1]);
+    const result = closeMobileThreadReminder(store.threads, tid);
+    if (result.ok) {
+      store.threads = result.threads;
+      saveStore();
+    }
+    return jsonResponse(result.data, result.status);
+  }
   const threadReminderMatch = pathname.match(/^\/api\/threads\/([^/]+)\/reminder$/);
   if (threadReminderMatch) {
     const tid = decodeURIComponent(threadReminderMatch[1]);
-    if (method === 'POST') {
+    if (method === 'PUT' || method === 'POST') {
       const body = await parseRequestBody(input, init);
-      store.threads = store.threads.map((t) => (String(t.id) === tid ? { ...t, reminder_due_at: body.due_at, reminder_note: body.note || '' } : t));
-      saveStore();
-      return jsonResponse({ success: true });
+      const result = setMobileThreadReminder(store.threads, tid, body);
+      if (result.ok) {
+        store.threads = result.threads;
+        saveStore();
+      }
+      return jsonResponse(result.data, result.status);
     }
     if (method === 'DELETE') {
-      store.threads = store.threads.map((t) => (String(t.id) === tid ? { ...t, reminder_due_at: null, reminder_note: null } : t));
-      saveStore();
-      return jsonResponse({ success: true });
+      const result = closeMobileThreadReminder(store.threads, tid);
+      if (result.ok) {
+        store.threads = result.threads;
+        saveStore();
+      }
+      return jsonResponse(result.data, result.status);
     }
   }
   const threadArchiveMatch = pathname.match(/^\/api\/threads\/([^/]+)\/archive$/);
   if (threadArchiveMatch && method === 'POST') {
     const tid = decodeURIComponent(threadArchiveMatch[1]);
     const body = await parseRequestBody(input, init);
-    const archivedAt = body.archived === false ? null : new Date().toISOString();
-    store.threads = store.threads.map((t) => (String(t.id) === tid ? { ...t, archived_at: archivedAt } : t));
-    saveStore();
-    return jsonResponse({ success: true, archived_at: archivedAt });
+    const shouldArchive = body?.archived === false ? false : true;
+    const result = setMobileThreadArchived(store.threads, tid, shouldArchive);
+    if (result.ok) {
+      store.threads = result.threads;
+      saveStore();
+    }
+    return jsonResponse(result.data, result.status);
+  }
+  const threadRestoreMatch = pathname.match(/^\/api\/threads\/([^/]+)\/restore$/);
+  if (threadRestoreMatch && method === 'POST') {
+    const tid = decodeURIComponent(threadRestoreMatch[1]);
+    const result = setMobileThreadArchived(store.threads, tid, false);
+    if (result.ok) {
+      store.threads = result.threads;
+      saveStore();
+    }
+    return jsonResponse(result.data, result.status);
   }
 
   // 7. Outbound Messages & Attachments
@@ -1661,27 +1724,36 @@ export async function handleMobileStandaloneApi(nativeFetch, urlStr, input, init
       return jsonResponse({ success: false, error: err.message, message: err.message }, 400);
     }
   }
-  if ((pathname === '/api/attachments/stage' || pathname === '/api/rich-messages/attachments') && method === 'POST') {
+  const threadStageAttMatch = pathname.match(/^\/api\/threads\/([^/]+)\/outbound-attachments$/);
+  if ((threadStageAttMatch || pathname === '/api/attachments/stage' || pathname === '/api/rich-messages/attachments') && method === 'POST') {
     const form = await parseRequestBody(input, init);
     const file = form instanceof FormData ? (form.get('file') || form.get('attachment')) : null;
     if (!file) return jsonResponse({ success: false, error: 'Không tìm thấy tệp đính kèm' }, 400);
-    const id = 'att_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7);
-    const mime = String(file.type || '');
-    const mediaType = mime.startsWith('video/') ? 'video' : (mime.startsWith('image/') ? 'image' : 'file');
-    const previewUrl = URL.createObjectURL(file);
-    const record = {
-      id,
-      attachment_id: id,
+    const threadId = threadStageAttMatch ? decodeURIComponent(threadStageAttMatch[1]) : null;
+    const record = stageMobileAttachment(stagedFiles, {
+      threadId,
       file,
-      preview_url: previewUrl,
-      media_url: previewUrl,
-      media_type: mediaType,
-      name: file.name || 'attachment',
-      size: file.size || 0,
-      mime_type: mime
-    };
-    stagedFiles.set(id, record);
-    return jsonResponse({ success: true, attachment: record, data: record });
+      createPreviewUrl: (f) => URL.createObjectURL(f)
+    });
+    const { file: _rawFile, ...publicAttachment } = record;
+    return jsonResponse({ success: true, attachment: publicAttachment, data: publicAttachment }, 201);
+  }
+  const threadDiscardAttMatch = pathname.match(/^\/api\/threads\/([^/]+)\/outbound-attachments\/([^/]+)$/);
+  if (threadDiscardAttMatch && method === 'DELETE') {
+    const threadId = decodeURIComponent(threadDiscardAttMatch[1]);
+    const attachmentId = decodeURIComponent(threadDiscardAttMatch[2]);
+    const discarded = discardMobileAttachment(stagedFiles, {
+      threadId,
+      attachmentId,
+      revokePreviewUrl: (url) => URL.revokeObjectURL(url)
+    });
+    if (!discarded) {
+      return jsonResponse({
+        code: 'ATTACHMENT_NOT_DISCARDABLE',
+        error: 'File không thuộc hội thoại này hoặc không còn ở trạng thái chờ gửi.'
+      }, 409);
+    }
+    return new Response(null, { status: 204 });
   }
 
   // 8. Contacts & Lead Statuses
@@ -2119,30 +2191,89 @@ export async function handleMobileStandaloneApi(nativeFetch, urlStr, input, init
     }
     return jsonResponse({ success: true, settings: store.phoneAutomation, ...store.phoneAutomation });
   }
-  if (pathname.startsWith('/api/employees')) {
+  if (pathname === '/api/company/employees' || pathname === '/api/employees') {
     const user = getSavedUser();
-    if (method === 'GET') return jsonResponse({ success: true, employees: store.employees, data: store.employees });
+    if (method === 'GET') {
+      return jsonResponse(buildMobileCompanyEmployeesPayload(store));
+    }
     if (method === 'POST') {
       const body = await parseRequestBody(input, init);
-      const resp = await nativeFetch(`${LICENSE_SERVER_BASE}/api/client-auth/company-employees`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ adminUsername: user?.username, username: body.username, password: body.password })
-      });
-      const data = await resp.json().catch(() => ({}));
-      if (resp.ok && data.success && data.data) {
-        store.employees.push(data.data);
-        saveStore();
+      const username = String(body?.username || '').trim();
+      const password = String(body?.password || '');
+      if (!username || !password) {
+        return jsonResponse({ success: false, error: 'Vui lòng nhập đầy đủ tên đăng nhập và mật khẩu.' }, 400);
       }
-      return jsonResponse(data, resp.status);
+      try {
+        const resp = await nativeFetch(`${LICENSE_SERVER_BASE}/api/client-auth/company-employees`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ adminUsername: user?.username, username, password })
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok || !data.success) {
+          return jsonResponse({
+            success: false,
+            error: data.error || data.message || 'License Server từ chối tạo nhân viên.'
+          }, resp.status || 400);
+        }
+        const employee = addMobileEmployee(store, data.data || { username });
+        saveStore();
+        return jsonResponse({ success: true, employee }, 201);
+      } catch (err) {
+        return jsonResponse({
+          success: false,
+          error: err?.message || 'Không thể kết nối License Server để tạo nhân viên.'
+        }, 502);
+      }
+    }
+  }
+  const empAccountsMatch = pathname.match(/^\/api\/(?:company\/)?employees\/([^/]+)\/accounts$/);
+  if (empAccountsMatch && method === 'PUT') {
+    const empId = decodeURIComponent(empAccountsMatch[1]);
+    const body = await parseRequestBody(input, init);
+    const updated = setMobileEmployeeAssignments(store, empId, body?.account_ids);
+    if (!updated) {
+      return jsonResponse({ success: false, error: 'Không tìm thấy nhân viên.' }, 404);
+    }
+    saveStore();
+    return jsonResponse({ success: true, account_ids: updated });
+  }
+  const empDeleteMatch = pathname.match(/^\/api\/(?:company\/)?employees\/([^/]+)$/);
+  if (empDeleteMatch && method === 'DELETE') {
+    const empId = decodeURIComponent(empDeleteMatch[1]);
+    const employee = findMobileEmployeeById(store, empId);
+    if (!employee) {
+      return jsonResponse({ success: false, error: 'Không tìm thấy nhân viên.' }, 404);
+    }
+    const user = getSavedUser();
+    try {
+      const resp = await nativeFetch(`${LICENSE_SERVER_BASE}/api/client-auth/company-employees`, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ adminUsername: user?.username, username: employee.username })
+      });
+      if (!resp.ok && resp.status !== 404) {
+        const data = await resp.json().catch(() => ({}));
+        return jsonResponse({
+          success: false,
+          error: data.error || data.message || 'Không thể xóa nhân viên trên License Server.'
+        }, resp.status || 502);
+      }
+      removeMobileEmployee(store, empId);
+      saveStore();
+      return jsonResponse({ success: true });
+    } catch (err) {
+      return jsonResponse({
+        success: false,
+        error: err?.message || 'Không thể kết nối License Server để xóa nhân viên.'
+      }, 502);
     }
   }
   if (pathname.startsWith('/api/search')) {
-    const q = String(parsedUrl.searchParams.get('q') || '').trim().toLowerCase();
-    const matchedThreads = !q
-      ? []
-      : store.threads.filter((t) => `${t.contact_name || ''} ${t.last_message || ''} ${t.phone || ''}`.toLowerCase().includes(q));
-    return jsonResponse({ success: true, threads: matchedThreads, messages: [] });
+    const q = parsedUrl.searchParams.get('q') || '';
+    const limit = parsedUrl.searchParams.get('limit') || 20;
+    const results = searchMobileStore(store, q, limit);
+    return jsonResponse(results);
   }
 
   return jsonResponse({ success: true });

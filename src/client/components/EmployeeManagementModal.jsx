@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { Check, CheckSquare, ChevronRight, Eye, Plus, RefreshCw, Square, Trash2, UserPlus, Users, X } from 'lucide-react';
 import ConfirmModal from './ConfirmModal';
+import { normalizeCompanyEmployeesPayload } from '../utils/mobileEmployees.js';
 
 // Module-level cache: giữ data giữa các lần mount/unmount
 let _cachedData = null;
@@ -27,10 +28,11 @@ export default function EmployeeManagementModal() {
     if (!response.ok || !payload.success) {
       throw new Error(payload.error || 'Không tải được danh sách nhân viên.');
     }
+    const normalized = normalizeCompanyEmployeesPayload(payload);
     // Cập nhật cache module-level
-    _cachedData = payload;
+    _cachedData = normalized;
     _cacheLoaded = true;
-    setData(payload);
+    setData(normalized);
     setSelected(new Set()); // clear selection on reload
   };
 
@@ -43,7 +45,10 @@ export default function EmployeeManagementModal() {
   }, []);
 
   // --- Selection helpers ---
-  const allIds = data.employees.map((e) => e.id);
+  const employeesList = Array.isArray(data?.employees) ? data.employees : [];
+  const accountsList = Array.isArray(data?.accounts) ? data.accounts : [];
+  const assignmentsMap = data?.assignments && typeof data.assignments === 'object' ? data.assignments : {};
+  const allIds = employeesList.map((e) => e.id);
   const allSelected = allIds.length > 0 && allIds.every((id) => selected.has(id));
   const someSelected = selected.size > 0 && !allSelected;
 
@@ -67,7 +72,7 @@ export default function EmployeeManagementModal() {
   // --- Bulk delete ---
   const removeSelected = () => {
     if (selected.size === 0) return;
-    const names = data.employees
+    const names = employeesList
       .filter((e) => selected.has(e.id))
       .map((e) => e.username)
       .join(', ');
@@ -104,7 +109,7 @@ export default function EmployeeManagementModal() {
   };
 
   const assign = async (employee, accountId) => {
-    const accountIds = new Set((data.assignments?.[employee.id] || []).map(String));
+    const accountIds = new Set((assignmentsMap?.[employee.id] || []).map(String));
     if (accountIds.has(String(accountId))) accountIds.delete(String(accountId));
     else accountIds.add(String(accountId));
 
@@ -259,7 +264,7 @@ export default function EmployeeManagementModal() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
-                  {data.employees.map((employee, index) => {
+                  {employeesList.map((employee, index) => {
                     const isChecked = selected.has(employee.id);
                     return (
                       <tr
@@ -322,7 +327,7 @@ export default function EmployeeManagementModal() {
                       </tr>
                     );
                   })}
-                  {!data.employees.length && (
+                  {!employeesList.length && (
                     <tr><td colSpan="6" className="px-5 py-16 text-center text-sm text-slate-500">Chưa có nhân viên. Bấm "Thêm nhân viên" để tạo tài khoản đầu tiên.</td></tr>
                   )}
                 </tbody>
@@ -334,7 +339,7 @@ export default function EmployeeManagementModal() {
           {selected.size > 0 && (
             <div className="flex items-center justify-between border-t border-slate-200 bg-blue-50 px-5 py-3">
               <span className="text-sm text-blue-700 font-medium">
-                Đã chọn <strong>{selected.size}</strong> / {data.employees.length} nhân viên
+                Đã chọn <strong>{selected.size}</strong> / {employeesList.length} nhân viên
               </span>
               <button
                 type="button"
@@ -375,8 +380,8 @@ export default function EmployeeManagementModal() {
               <button type="button" aria-label="Đóng" onClick={() => setAssigningEmployee(null)} className="rounded-lg p-2 text-slate-500 hover:bg-slate-100"><X size={18} /></button>
             </header>
             <div className="max-h-[55vh] space-y-2 overflow-y-auto p-5">
-              {data.accounts.filter((account) => assignmentViewMode !== 'view' || (data.assignments?.[assigningEmployee.id] || []).map(String).includes(String(account.id))).map((account) => {
-                const checked = (data.assignments?.[assigningEmployee.id] || []).map(String).includes(String(account.id));
+              {accountsList.filter((account) => assignmentViewMode !== 'view' || (assignmentsMap?.[assigningEmployee.id] || []).map(String).includes(String(account.id))).map((account) => {
+                const checked = (assignmentsMap?.[assigningEmployee.id] || []).map(String).includes(String(account.id));
                 return (
                   <label key={account.id} className={`flex items-center gap-3 rounded-xl border px-4 py-3 text-sm ${assignmentViewMode === 'edit' ? 'cursor-pointer' : ''} ${checked ? 'border-blue-300 bg-blue-50' : 'border-slate-200 hover:bg-slate-50'}`}>
                     <input className="sr-only" type="checkbox" checked={checked} disabled={busy || assignmentViewMode === 'view'} onChange={() => assign(assigningEmployee, account.id)} />
@@ -386,10 +391,10 @@ export default function EmployeeManagementModal() {
                   </label>
                 );
               })}
-              {(assignmentViewMode === 'view' ? !(data.assignments?.[assigningEmployee.id] || []).length : !data.accounts.length) && <div className="rounded-xl border border-dashed border-slate-300 py-10 text-center text-sm text-slate-500">{assignmentViewMode === 'view' ? 'Nhân viên này chưa được gán tài khoản Facebook.' : 'Công ty chưa có tài khoản Facebook để gán.'}</div>}
+              {(assignmentViewMode === 'view' ? !(assignmentsMap?.[assigningEmployee.id] || []).length : !accountsList.length) && <div className="rounded-xl border border-dashed border-slate-300 py-10 text-center text-sm text-slate-500">{assignmentViewMode === 'view' ? 'Nhân viên này chưa được gán tài khoản Facebook.' : 'Công ty chưa có tài khoản Facebook để gán.'}</div>}
             </div>
             <footer className="flex items-center justify-between border-t border-slate-200 bg-slate-50 px-5 py-4">
-              <span className="text-xs text-slate-500">Đã chọn {(data.assignments?.[assigningEmployee.id] || []).length} tài khoản</span>
+              <span className="text-xs text-slate-500">Đã chọn {(assignmentsMap?.[assigningEmployee.id] || []).length} tài khoản</span>
               <button type="button" onClick={() => setAssigningEmployee(null)} className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white hover:bg-blue-700">Xong</button>
             </footer>
           </section>

@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Search, X, MessageSquare } from 'lucide-react';
+import { normalizeSearchResults, tokenizeHighlight } from '../utils/mobileSearch.js';
 
 export default function SearchOverlay({ onClose, onSelectThread }) {
   const [query, setQuery] = useState('');
@@ -14,23 +15,41 @@ export default function SearchOverlay({ onClose, onSelectThread }) {
   useEffect(() => {
     if (!query.trim() || query.trim().length < 2) {
       setResults([]);
+      setLoading(false);
       return;
     }
+
+    let cancelled = false;
+    const controller = new AbortController();
 
     const timer = setTimeout(async () => {
       setLoading(true);
       try {
-        const res = await fetch(`/api/search?q=${encodeURIComponent(query)}&limit=20`);
+        const res = await fetch(`/api/search?q=${encodeURIComponent(query)}&limit=20`, {
+          signal: controller.signal
+        });
+        if (!res.ok) {
+          if (!cancelled) setResults([]);
+          return;
+        }
         const data = await res.json();
-        setResults(data);
-      } catch {
-        setResults([]);
+        if (!cancelled) {
+          setResults(normalizeSearchResults(data));
+        }
+      } catch (err) {
+        if (!cancelled && err?.name !== 'AbortError') {
+          setResults([]);
+        }
       } finally {
-        setLoading(false);
+        if (!cancelled) setLoading(false);
       }
     }, 300);
 
-    return () => clearTimeout(timer);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+      controller.abort();
+    };
   }, [query]);
 
   return (
@@ -92,14 +111,17 @@ export default function SearchOverlay({ onClose, onSelectThread }) {
                     {r.created_at ? new Date(r.created_at).toLocaleDateString('vi') : ''}
                   </span>
                 </div>
-                <p
-                  className="text-xs text-slate-400 truncate"
-                  dangerouslySetInnerHTML={{
-                    __html: (r.highlight || r.content || '').replace(
-                      /<mark>/g, '<mark class="bg-amber-500/20 text-amber-200 rounded px-0.5">'
+                <p className="text-xs text-slate-400 truncate">
+                  {tokenizeHighlight(r.highlight || r.content || '').map((part, idx) =>
+                    part.marked ? (
+                      <mark key={idx} className="bg-amber-500/20 text-amber-200 rounded px-0.5">
+                        {part.text}
+                      </mark>
+                    ) : (
+                      <React.Fragment key={idx}>{part.text}</React.Fragment>
                     )
-                  }}
-                />
+                  )}
+                </p>
               </div>
               <MessageSquare className="text-slate-600 shrink-0 mt-0.5" size={13} />
             </button>

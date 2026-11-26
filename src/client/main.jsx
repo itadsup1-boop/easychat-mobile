@@ -118,6 +118,7 @@ window.fetch = async (input, init = {}) => {
     }
     return resp;
   } catch (err) {
+    if (err?.name === 'AbortError') throw err;
     // Fallback to standalone mobile engine if local/remote backend is unreachable
     if (isLocalApiCall || (apiBase && url.startsWith(`${apiBase}/api/`))) {
       const relPath = apiBase && url.startsWith(apiBase)
